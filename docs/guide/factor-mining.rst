@@ -25,6 +25,50 @@
 引擎自动在优胜候选的邻域生成细粒度网格。Optuna 只负责分布和 trial，
 worker 只接收普通参数字典，不负责缓存或进程调度。
 
+Alpha101 自动参数空间
+----------------------
+
+Alpha101 可以在 ``parameter_space.yaml`` 中逐因子显式声明参数空间；也可以将
+``factors`` 设为 ``all``，由 ``alpha101_parameters.aggregate_mining_factors()``
+为 ALPHA1 至 ALPHA101 生成参数定义。显式声明时不会调用自动生成逻辑。
+
+自动生成首先读取 ``alpha101_formulas.py`` 中各 ``alphaN`` 函数的关键字默认值，
+再根据参数名后缀分类。``*_window``、``*_lag``、``*_threshold``、
+``*_exponent`` 和 ``*_weight`` 可搜索；其他参数固定为论文默认值。默认按照公式
+签名顺序最多放开前三个可搜索参数，可通过 ``max_dimensions`` 调整。
+
+.. list-table:: 论文默认值 ``d`` 周围的参考点
+   :header-rows: 1
+
+   * - 参数种类
+     - 参考点规则
+   * - 整数 window / lag
+     - 约 ``[0.5d, d, 2d]``，并保证不小于 1
+   * - 浮点 window / lag
+     - ``[0.5d, d, 2d]``
+   * - weight
+     - ``[max(0, 0.5d), d, min(1, 1.5d)]``
+   * - threshold
+     - ``[d-s, d, d+s]``，其中 ``s=max(0.5*abs(d), 0.05)``
+   * - exponent
+     - ``[0.5d, d, 2d]``
+   * - 其他
+     - ``[d]``，即固定值
+
+这些参考点只用于计算 ``low`` 和 ``high``，不是离散候选集合。例如 ALPHA3 的
+相关系数窗口默认值为 10，自动得到 ``low=5``、``high=20``、``step=1`` 和
+``scale=log``；粗搜可以在 5 至 20 的整个整数区间采样。window / lag 使用对数
+尺度，其他数值参数使用线性尺度。该规则是围绕论文默认值的启发式边界，不读取
+历史数据，也不保证得到统计意义上的最优搜索范围。
+
+参数定义可用字段如下：
+
+* ``type``：``int`` / ``float`` / ``categorical`` / ``bool``；
+* ``low`` / ``high``：数值参数的闭区间边界；
+* ``step``：正数步长；对数整数只能为 1，对数浮点不能设置；
+* ``scale``：``linear`` / ``log``，使用 ``log`` 时 ``low`` 必须大于 0；
+* ``choices``：categorical 的非空候选列表；bool 省略时默认为 ``[false, true]``。
+
 因子 hook
 ---------
 

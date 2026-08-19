@@ -1,4 +1,10 @@
-"""Mining hooks that adapt all Alpha101 formulas to betalens.factor.mining."""
+"""将 Alpha101 公式适配到统一 mining 执行接口。
+
+本模块不决定参数空间；参数边界来自 ``parameter_space.yaml``，或在配置使用
+``factors: all`` 时由 :mod:`alpha101_parameters` 生成。这里仅根据一个普通参数
+字典构造 ``MiningSpec``，声明该 Alpha 的输入字段、公式参数、预热长度和
+``precomputed`` 执行模式。
+"""
 from __future__ import annotations
 
 from typing import Any, Mapping
@@ -37,7 +43,7 @@ def compute_alpha_mining(**kwargs):
 
 
 def make_mining_spec(params: Mapping[str, Any]) -> MiningSpec:
-    """Declare only the selected Alpha's actual cache inputs."""
+    """根据一个候选参数字典声明所选 Alpha 的计算与缓存输入。"""
     alpha_id = _alpha_id(params)
     definition = get_definition(alpha_id)
     formula_kwargs = _formula_kwargs(params)
@@ -67,6 +73,7 @@ def make_mining_spec(params: Mapping[str, Any]) -> MiningSpec:
 
 
 def mining_warmup_days(params: Mapping[str, Any]) -> int:
+    """按公式所需历史 bars 推导自然日预热长度，并保证至少 30 天。"""
     alpha_id = _alpha_id(params)
     bars = required_history_bars_for_alpha(alpha_id, _formula_kwargs(params))
     return max(30, int(bars) * 2 + 30)

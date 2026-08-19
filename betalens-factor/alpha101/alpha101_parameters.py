@@ -1,4 +1,21 @@
-"""Explicit Alpha101 parameter catalogs and bounded grid expansion."""
+"""Alpha101 公式参数目录与自动挖掘边界生成。
+
+参数元数据来自 :mod:`alpha101_formulas` 中每个 ``alphaN`` 函数的关键字默认值。
+自动参数空间是围绕论文默认值生成的启发式范围，不读取历史数据，也不根据回测
+结果反推全局边界。默认最多放开公式签名中靠前的三个可搜索参数；其余参数仍会
+进入配置，但 ``low == high == default``。
+
+边界规则：
+
+* ``window`` / ``lag``：约 ``[0.5d, d, 2d]``，最小值为 1；
+* ``weight``：``[max(0, 0.5d), d, min(1, 1.5d)]``；
+* ``threshold``：``d +/- max(0.5 * abs(d), 0.05)``；
+* ``exponent``：``[0.5d, d, 2d]``；
+* 其他种类固定为论文默认值 ``d``。
+
+参考点最终只用于推导 ``low`` / ``high``。粗搜会在完整边界内采样，而不是只在
+三个参考点上取值；``window`` / ``lag`` 使用对数尺度，其他参数使用线性尺度。
+"""
 from __future__ import annotations
 
 import itertools
@@ -23,7 +40,7 @@ def _unique(values: Sequence[int | float]) -> list[int | float]:
 
 
 def candidate_values(spec: AlphaParameter) -> list[int | float]:
-    """Return a compact, auditable three-point range around a paper default."""
+    """按参数种类返回论文默认值附近、用于推导边界的参考点。"""
     default = spec.default
     if spec.kind in {"window", "lag"}:
         if isinstance(default, float):
@@ -45,7 +62,7 @@ def candidate_values(spec: AlphaParameter) -> list[int | float]:
 
 
 def default_search_space(alpha_id: str | int, max_dimensions: int = 3) -> dict[str, list[int | float]]:
-    """Build the explicit YAML search space, varying at most three parameters."""
+    """按公式参数顺序放开至多 ``max_dimensions`` 个可搜索参数。"""
     if int(max_dimensions) < 0:
         raise ValueError("max_dimensions must be >= 0")
     remaining = int(max_dimensions)
@@ -62,7 +79,11 @@ def default_search_space(alpha_id: str | int, max_dimensions: int = 3) -> dict[s
 
 
 def mining_parameter_specs(alpha_id: str | int, max_dimensions: int = 3) -> dict[str, dict[str, Any]]:
-    """Convert formula metadata into the aggregate mining YAML parameter schema."""
+    """将参考点转换为 mining 使用的类型、边界、步长和尺度定义。
+
+    整数参数使用 ``step=1``；窗口和滞后参数使用 ``scale=log``，其余参数使用
+    ``scale=linear``。参考点本身不会作为 categorical 候选保留下来。
+    """
     values_by_name = default_search_space(alpha_id, max_dimensions=max_dimensions)
     output = {}
     for name, values in values_by_name.items():
@@ -109,7 +130,7 @@ def mining_optuna_distributions(
 
 
 def aggregate_mining_factors() -> dict[str, dict[str, Any]]:
-    """Expand ``factors: all`` into the centralized Alpha101 parameter catalog."""
+    """将 ``factors: all`` 展开为 ALPHA1 至 ALPHA101 的自动参数空间。"""
     return {
         get_definition(number).name: {
             "module": "alpha101_mining",

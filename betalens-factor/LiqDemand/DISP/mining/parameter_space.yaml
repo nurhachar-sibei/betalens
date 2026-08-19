@@ -1,59 +1,96 @@
+# 配置版本；当前仅支持 1。
 version: 1
+# 因子类别，仅用于任务元信息和输出归类。
 factor_class: DISP
 
+# DISP 使用显式因子映射；每个条目是一套可独立运行的因子配置。
 factors:
   DISP:
+    # 可导入且提供 make_mining_spec(params) 的 Python 模块。
     module: factor_DISP
+    # 可选：precomputed | rolling_fit。DISP 先全程计算因子，再按窗口变换权重。
     execution_mode: precomputed
     parameters:
       window:
+        # 可选：int | float | categorical | bool。
         type: int
+        # 数值参数的闭区间边界。
         low: 20
         high: 500
+        # 正整数步长；候选窗口只能取 20, 25, ..., 500。
         step: 5
+        # 可选：linear | log。log 要求 low > 0，且 int 的 step 必须为 1。
         scale: linear
       pretom:
+        # categorical 直接枚举，不参与数值细化。
         type: categorical
+        # 每个选项是 [回看月份, 跳过月份]；元组在 YAML 中写成二维列表。
         choices: [[9, 4], [7, 4]]
       pretom_only:
+        # categorical 可枚举布尔值；也可写 type: bool 并省略 choices。
         type: categorical
+        # true 仅使用窗口级 pretom 变换；false 使用 DISP 原始权重流程。
         choices: [true, false]
       n_quantiles:
+        # 分组数，只搜索 10、20、30、40。
         type: int
         low: 10
         high: 40
         step: 10
+        # scale 省略时默认为 linear。
 
 evaluation:
+  # 评分区间 [开始日期, 结束日期]，格式 YYYY-MM-DD。
   span: ["2010-01-01", "2022-12-31"]
+  # 调仓频率，使用 pandas 频率字符串；常用：D | W | M。
   rebal_freq: D
+  # 可选：vector | exact。vector 适合搜索，exact 适合精确成交复核。
   engine: vector
+  # 回测初始资金，必须为正数。
   initial_amount: 100000000
+  # 可选：行情查询容忍时间（小时），默认 24。
+  # time_tolerance: 24
 
 windows:
+  # 评分窗口长度，单位为交易日，可配置多个正整数。
   lengths: [252, 504]
+  # 窗口滑动步长，单位为交易日；每个 step 必须 <= 每个 length。
   steps: [21, 63]
 
 search:
   coarse:
+    # 可选：random | tpe。
     sampler: random
+    # 粗搜试验数，正整数；重复参数会由候选 ID 去重。
     n_trials: 64
+    # 固定随机种子，保证候选生成可复现。
     seed: 20260818
   fine:
+    # 取粗搜排名靠前的多少个入选候选作为局部网格锚点。
     top_k: 8
+    # 每个数值参数在局部边界内生成的网格点数，正整数。
     points_per_dimension: 7
+    # 细搜候选总上限，防止多参数笛卡尔积失控。
     max_candidates: 256
 
 selection:
   objective:
+    # 可选窗口指标：ann_ret | ann_vol | sharpe | mdd | calmar | turnover |
+    # rank_ic | ic_coverage | n_days。
     metric: sharpe
+    # 可选聚合：mean | median | p25 | min | max。
     aggregate: median
+    # 可选：maximize | minimize。
     direction: maximize
   filters:
+    # 汇总字段可使用 valid_window_ratio、max_mdd 或 <指标>_<聚合>，
+    # 例如 sharpe_median、ann_ret_p25、turnover_mean。
     - metric: valid_window_ratio
+      # 可选：">=" | "<=" | ">" | "<" | "=="。
       op: ">="
       value: 0.8
     - metric: max_mdd
       op: "<="
       value: 0.35
+  # 最终最多保留的赢家数量，正整数。
   top_k: 10
