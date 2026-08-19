@@ -52,9 +52,7 @@ def parse_int_list(value: Any) -> list[int]:
     return [int(str(item).strip()) for item in raw if str(item).strip()]
 
 
-def build_holding_periods(params: dict[str, Any]) -> dict[str, list[int]] | None:
-    if str(params["mode"]) != "fixed":
-        return None
+def build_holding_periods(params: dict[str, Any]) -> dict[str, list[int]]:
     return {
         "days": parse_int_list(params["holding_days"]),
         "months": parse_int_list(params["holding_months"]),
@@ -108,7 +106,6 @@ def main() -> int:
     benchmark_code = str(params["benchmark_code"] or "").strip() or None
     metric = str(params["metric"])
     table_name = str(params["table_name"])
-    mode = str(params["mode"])
     multi_asset_mode = str(params.get("multi_asset_mode", "aggregate"))
     window_before = int(params["window_before"])
     window_after = int(params["window_after"])
@@ -123,7 +120,6 @@ def main() -> int:
     print(f"  - 基准代码: {benchmark_code or '-'}")
     print(f"  - 价格指标: {metric}")
     print(f"  - 数据表: {table_name}")
-    print(f"  - 模式: {mode}")
     print(f"  - 多标的处理: {multi_asset_mode}")
     print(f"  - 窗口: -{window_before} / +{window_after}")
 
@@ -137,7 +133,6 @@ def main() -> int:
             window_before=window_before,
             window_after=window_after,
             metric=metric,
-            mode=mode,
             holding_periods=build_holding_periods(params),
             holding_start_offset=holding_start_offset,
             market_close_hour=market_close_hour,
@@ -151,38 +146,39 @@ def main() -> int:
         return 1
 
     daily_stats = result["daily_stats"]
-    cumulative_stats = result["cumulative_stats"]
+    holding_stats = result["holding_stats"]
     print(f"[OK] 成功分析 {result['event_count']} 个事件")
     print("\n【每日平均收益率统计】")
     print(daily_stats.to_string())
-    print("\n【累积收益率统计】")
-    print(cumulative_stats.to_string())
+    print("\n【持有收益统计】")
+    print(holding_stats.to_string())
 
     if save_results:
         output_file = resolve_path(params["output"], config_path.parent)
         output_file.parent.mkdir(parents=True, exist_ok=True)
         with pd.ExcelWriter(output_file) as writer:
             daily_stats.to_excel(writer, sheet_name="daily_stats")
-            cumulative_stats.to_excel(writer, sheet_name="cumulative_stats")
+            holding_stats.to_excel(writer, sheet_name="holding_stats")
             result["returns_matrix"].to_excel(writer, sheet_name="returns_matrix")
+            result["price_matrix"].to_excel(writer, sheet_name="price_matrix")
             comparison = result.get("comparison")
             if comparison:
                 summaries = []
-                used_sheets = {"daily_stats", "cumulative_stats", "returns_matrix"}
+                used_sheets = {"daily_stats", "holding_stats", "returns_matrix", "price_matrix"}
                 for code, item in comparison["by_code"].items():
                     daily = item["daily_stats"]
-                    cumulative = item["cumulative_stats"]
+                    holding = item["holding_stats"]
                     summaries.append(
                         {
                             "code": code,
                             "event_count": item["event_count"],
                             "coverage": item["coverage"],
                             "day0_mean": daily.loc[0, "mean"] if 0 in daily.index else None,
-                            "final_mean": cumulative.iloc[-1]["mean"] if not cumulative.empty else None,
+                            "holding_mean": holding.iloc[-1]["mean"] if not holding.empty else None,
                         }
                     )
                     daily.to_excel(writer, sheet_name=_sheet_name("daily", code, used_sheets))
-                    cumulative.to_excel(writer, sheet_name=_sheet_name("cum", code, used_sheets))
+                    holding.to_excel(writer, sheet_name=_sheet_name("holding", code, used_sheets))
                 pd.DataFrame(summaries).to_excel(writer, sheet_name="comparison_summary", index=False)
                 pd.DataFrame(comparison["events"]).to_excel(writer, sheet_name="comparison_events", index=False)
         print(f"\n[OK] 详细结果已保存到: {output_file}")

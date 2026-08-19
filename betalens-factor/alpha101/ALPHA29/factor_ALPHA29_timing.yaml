@@ -53,27 +53,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    close_center:
-    - 1
-    close_delta_lag:
-    - 3
-    - 5
-    - 10
-    rank_inner_minimum_window:
-    - 1
-    - 2
-    - 4
-    ts_min_rank_inner_sum_window:
-    - 1
-    - 2
-    rank_scale_ts_sum_product_window:
-    - 1
-    product_rank_scale_minimum_window:
-    - 5
-    returns_delay_lag:
-    - 6
-    delay_returns_rank_window:
-    - 5

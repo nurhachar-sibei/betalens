@@ -1,0 +1,50 @@
+version: 1
+factor_class: alpha101
+
+# Expand all Alpha definitions through alpha101_parameters.default_search_space.
+# Individual entries can be added here to override a generated space.
+factors:
+  ALPHA3:
+    module: alpha101_mining
+    execution_mode: precomputed
+    parameters:
+      rank_open_rank_volume_correlation_window:
+        type: int
+        low: 5
+        high: 20
+        scale: log
+        step: 1
+
+evaluation:
+  span: ["2010-01-01", "2022-12-31"]
+  rebal_freq: W
+  engine: vector
+  initial_amount: 100000000
+
+windows:
+  lengths: [252, 504]
+  steps: [21, 63]
+
+search:
+  coarse:
+    sampler: random
+    n_trials: 64
+    seed: 20260818
+  fine:
+    top_k: 8
+    points_per_dimension: 7
+    max_candidates: 256
+
+selection:
+  objective:
+    metric: sharpe
+    aggregate: median
+    direction: maximize
+  filters:
+    - metric: valid_window_ratio
+      op: ">="
+      value: 0.8
+    - metric: max_mdd
+      op: "<="
+      value: 0.35
+  top_k: 10

@@ -60,33 +60,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    rank_correlation_close_coefficient:
-    - 2.21
-    volume_delay_lag:
-    - 1
-    - 2
-    close_open_delay_volume_correlation_window:
-    - 8
-    - 15
-    - 30
-    rank_open_close_coefficient:
-    - 0.7
-    rank_ts_rank_delay_coefficient:
-    - 0.73
-    returns_delay_lag:
-    - 3
-    - 6
-    - 12
-    delay_returns_rank_window:
-    - 5
-    amount_average_window:
-    - 20
-    vwap_adv_correlation_window:
-    - 6
-    rank_open_close_coefficient_2:
-    - 0.6
-    close_mean_window:
-    - 200

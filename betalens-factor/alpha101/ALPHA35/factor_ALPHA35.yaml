@@ -44,22 +44,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    volume_rank_window:
-    - 16
-    - 32
-    - 64
-    ts_rank_low_close_complement_base:
-    - 1
-    low_close_high_rank_window:
-    - 8
-    - 16
-    - 32
-    ts_rank_returns_complement_base:
-    - 1
-    returns_rank_window:
-    - 16
-    - 32
-    - 64

@@ -1,2345 +1,2015 @@
+"""Two-stage, window-aware factor parameter mining."""
 from __future__ import annotations
 
-import contextlib
-import importlib
-import itertools
 import hashlib
+import importlib
 import json
+import logging
+import math
+import multiprocessing as mp
 import os
 import shutil
+import sys
+import threading
 import time
 import traceback
+import uuid
 import warnings
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
-from dataclasses import dataclass
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from logging.handlers import QueueHandler, QueueListener
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 
 
-__all__ = [
-    "ParameterSweepConfig",
-    "RollingMiningConfig",
-    "build_grid_combos",
-    "gen_rolling_windows",
-    "gen_rolling_train_test_windows",
-    "mean_one_way_turnover",
-    "metrics_from_nav",
-    "robust_rank_ic_metrics",
-    "run_parameter_sweep",
-    "run_walk_forward",
-    "tally_champions",
-]
+_LOGGER_NAME = "betalens.factor.mining"
+_LOGGER = logging.getLogger(_LOGGER_NAME)
+_TASK_LOGS = False
+_HEARTBEAT_SECONDS = 30.0
+_ACTIVE_RUN_MANIFEST: dict[str, Any] | None = None
+_ACTIVE_RUN_MANIFEST_PATH: Path | None = None
 
 
-DEFAULT_WORKERS = min(10, max(1, (os.cpu_count() or 4) - 2))
-DEFAULT_MAX_MEMORY_RATIO = 0.50
-DEFAULT_CACHE_MEMORY_MULTIPLIER = 3.0
-DEFAULT_WORKER_MEMORY_OVERHEAD_BYTES = 512 * 1024 * 1024
-CACHE_SCHEMA_VERSION = 3
+class _ChineseLogFormatter(logging.Formatter):
+    """Render logging metadata in Chinese for terminal and audit output."""
 
-
-@dataclass
-class CachePaths:
-    data: Path
-    pit: Path
-    meta: Path
-
-
-@dataclass
-class ParameterSweepConfig:
-    factor_module: str
-    output_dir: str | Path
-    span: tuple[str, str]
-    grid: Mapping[str, Sequence[Any]]
-    spec_factory: str = "make_mining_spec"
-    gid_factory: str | None = None
-    weight_hook: str | None = None
-    warmup_days_factory: Callable[[Mapping[str, Any]], int] | None = None
-    objective: str = "sharpe"
-    objective_higher_is_better: bool = True
-    engine: str = "exact"
-    workers: int = 1
-    cache_dir: str | Path | None = None
-    rebuild_cache: bool = False
-    rebal_freq: str = "D"
-    n_quantiles_param: str = "n_quantiles"
-    initial_amount: float = 1e8
-    time_tolerance: int = 24 * 11
-    max_warmup_days: int = 1200
-    max_memory_ratio: float = DEFAULT_MAX_MEMORY_RATIO
-    max_memory_bytes: int | None = None
-    cache_memory_multiplier: float = DEFAULT_CACHE_MEMORY_MULTIPLIER
-    worker_memory_overhead_bytes: int = DEFAULT_WORKER_MEMORY_OVERHEAD_BYTES
-    universe: Sequence[str] | None = None
-    results_filename: str = "sweep_results.csv"
-
-
-@dataclass
-class RollingMiningConfig:
-    factor_module: str
-    output_dir: str | Path
-    grid: Mapping[str, Sequence[Any]]
-    train: tuple[str, str]
-    test: tuple[str, str]
-    valid: tuple[str, str]
-    train_schemes: Sequence[tuple[int, int]]
-    test_schemes: Sequence[tuple[int, int]]
-    spec_factory: str = "make_mining_spec"
-    gid_factory: str | None = None
-    weight_hook: str | None = None
-    valid_report_hook: str | None = None
-    warmup_days_factory: Callable[[Mapping[str, Any]], int] | None = None
-    objective: str = "sharpe"
-    objective_higher_is_better: bool = True
-    candidate_percentile: tuple[float, float] = (0.50, 0.75)
-    report_top_n: int = 3
-    engine: str = "exact"
-    workers: int = DEFAULT_WORKERS
-    cache_dir: str | Path | None = None
-    rebuild_cache: bool = False
-    rebal_freq: str = "D"
-    n_quantiles_param: str = "n_quantiles"
-    initial_amount: float = 1e8
-    time_tolerance: int = 24 * 11
-    max_warmup_days: int = 1200
-    max_memory_ratio: float = DEFAULT_MAX_MEMORY_RATIO
-    max_memory_bytes: int | None = None
-    cache_memory_multiplier: float = DEFAULT_CACHE_MEMORY_MULTIPLIER
-    worker_memory_overhead_bytes: int = DEFAULT_WORKER_MEMORY_OVERHEAD_BYTES
-    max_windows_per_scheme: int | None = None
-    # ``split`` preserves the original two-stage behaviour.  ``paired``
-    # creates a train window followed immediately by its test window and
-    # advances both together, which is the usual walk-forward protocol.
-    rolling_mode: str = "split"
-    paired_schemes: Sequence[tuple[int, int, int]] | None = None
-    rolling_span: tuple[str, str] | None = None
-    universe: Sequence[str] | None = None
-    sampler: str | None = None
-    paper_params: Mapping[str, Any] | None = None
-    n_trials: int = 96
-    max_grid_candidates: int = 256
-    random_seed: int = 20260810
-    ic_coverage_min: float = 0.80
-    max_drawdown_max: float = 0.35
-    turnover_max: float = 1.00
-    pruning_enabled: bool = False
-    pruning_stages: Sequence[float] = (1.0,)
-    pruning_reduction_factor: int = 3
-    pruning_min_full_candidates: int = 3
-    pruning_keep_paper: bool = True
-    config_hash: str = ""
-    log_level: str = "INFO"
-    storage_url: str | None = None
-    config_path: str | None = None
-    runtime_root: str | Path | None = None
-    min_workers: int = 10
-    max_workers: int = 12
-    max_active_windows: int = 12
-    max_inflight_batches: int = 12
-    grid_batch_max_candidates: int = 8
-    grid_batch_target_seconds: float = 10.0
-    grid_prefetch_batches: int = 24
-    storage_queue_max_batches: int = 24
-    audit_queue_max_events: int = 20_000
-    console_trial_events: bool = False
-    scheduler_schema_version: int = 3
-    max_persist_overlap_batches: int = 1
-    sqlite_batch_transactions: bool = True
-    scheduler_wait_seconds: float = 0.25
-    audit_incremental: bool = True
-    resource_check_seconds: int = 15
-    resource_wait_minutes: int = 30
-    memory_low_watermark_ratio: float = 0.15
-    memory_resume_watermark_ratio: float = 0.20
-    audit_mirror_seconds: int = 60
-    partial_refresh_seconds: int = 60
-    partial_refresh_trials: int = 250
-    snapshot_seconds: int = 300
-    blas_threads: int = 1
-    search_hash: str = ""
-    runtime_hash: str = ""
-    # Grid/vector optimization: compute each candidate once for the complete
-    # discovery span and score rolling windows by slicing in the same worker.
-    candidate_major: bool = True
-
-
-_CACHE_DATA: dict[str, Any] | None = None
-_PIT_UNIVERSE: dict[Any, set[str]] | None = None
-
-
-def _as_path(path: str | Path) -> Path:
-    return path if isinstance(path, Path) else Path(path)
-
-
-def _format_bytes(value: int | float | None) -> str:
-    if value is None:
-        return "unknown"
-    value = float(value)
-    units = ("B", "KB", "MB", "GB", "TB")
-    for unit in units:
-        if abs(value) < 1024 or unit == units[-1]:
-            return f"{value:.1f}{unit}"
-        value /= 1024
-    return f"{value:.1f}TB"
-
-
-def _system_resource_snapshot() -> dict[str, int | None]:
-    """Return physical and commit/pagefile capacity without opening a data source."""
-    if os.name == "nt":
-        try:
-            import ctypes
-
-            class MEMORYSTATUSEX(ctypes.Structure):
-                _fields_ = [
-                    ("dwLength", ctypes.c_ulong),
-                    ("dwMemoryLoad", ctypes.c_ulong),
-                    ("ullTotalPhys", ctypes.c_ulonglong),
-                    ("ullAvailPhys", ctypes.c_ulonglong),
-                    ("ullTotalPageFile", ctypes.c_ulonglong),
-                    ("ullAvailPageFile", ctypes.c_ulonglong),
-                    ("ullTotalVirtual", ctypes.c_ulonglong),
-                    ("ullAvailVirtual", ctypes.c_ulonglong),
-                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-                ]
-
-            status = MEMORYSTATUSEX()
-            status.dwLength = ctypes.sizeof(status)
-            ok = ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
-            if ok:
-                return {
-                    "physical_total": int(status.ullTotalPhys),
-                    "physical_available": int(status.ullAvailPhys),
-                    "commit_total": int(status.ullTotalPageFile),
-                    "commit_available": int(status.ullAvailPageFile),
-                }
-        except Exception:
-            pass
-    else:
-        try:
-            page_size = int(os.sysconf("SC_PAGE_SIZE"))
-            total_pages = int(os.sysconf("SC_PHYS_PAGES"))
-            avail_pages = int(os.sysconf("SC_AVPHYS_PAGES"))
-            return {
-                "physical_total": page_size * total_pages,
-                "physical_available": page_size * avail_pages,
-                "commit_total": None,
-                "commit_available": None,
-            }
-        except (AttributeError, OSError, ValueError):
-            pass
-    return {
-        "physical_total": None,
-        "physical_available": None,
-        "commit_total": None,
-        "commit_available": None,
+    _LEVEL_NAMES = {
+        logging.DEBUG: "调试",
+        logging.INFO: "信息",
+        logging.WARNING: "警告",
+        logging.ERROR: "错误",
+        logging.CRITICAL: "严重",
     }
 
-
-def _system_memory_snapshot() -> tuple[int | None, int | None]:
-    resources = _system_resource_snapshot()
-    return resources["physical_total"], resources["physical_available"]
-
-
-def _memory_budget_bytes(config: Any) -> int | None:
-    explicit = getattr(config, "max_memory_bytes", None)
-    if explicit:
-        return int(explicit)
-    total, _ = _system_memory_snapshot()
-    if not total:
-        return None
-    ratio = float(getattr(config, "max_memory_ratio", DEFAULT_MAX_MEMORY_RATIO))
-    if ratio <= 0:
-        return None
-    return int(total * min(ratio, 1.0))
-
-
-def _dataframe_memory_bytes(df: pd.DataFrame | pd.Series | None) -> int:
-    if df is None:
-        return 0
-    try:
-        usage = df.memory_usage(index=True, deep=True)
-        if hasattr(usage, "sum"):
-            return int(usage.sum())
-        return int(usage)
-    except Exception:
-        return 0
-
-
-def _cache_payload_memory_bytes(inputs: Mapping[str, Any], price: Any) -> int:
-    total = 0
-    seen = set()
-    for obj in list(inputs.values()) + [price]:
-        obj_id = id(obj)
-        if obj_id in seen:
-            continue
-        seen.add(obj_id)
-        total += _dataframe_memory_bytes(obj)
-    return int(total)
-
-
-def _clear_status_line():
-    width = shutil.get_terminal_size((120, 20)).columns
-    print("\r" + " " * max(width - 1, 1) + "\r", end="", flush=True)
-
-
-def _render_progress_bar(
-    done: int,
-    total: int,
-    start_time: float,
-    *,
-    submitted: int | None = None,
-    active: int | None = None,
-    final: bool = False,
-):
-    width = shutil.get_terminal_size((120, 20)).columns
-    bar_width = 28
-    ratio = (done / total) if total else 1.0
-    filled = int(bar_width * ratio)
-    bar = "#" * filled + "-" * (bar_width - filled)
-    elapsed = time.time() - start_time
-    eta = elapsed / done * (total - done) if done else 0.0
-    extra = ""
-    if submitted is not None:
-        extra += f" submitted={submitted}/{total}"
-    if active is not None:
-        extra += f" active={active}"
-    line = (
-        f"  progress [{bar}] {done}/{total} {ratio:6.1%}"
-        f" elapsed={elapsed:,.0f}s eta={eta:,.0f}s{extra}"
-    )
-    if len(line) > width - 1:
-        line = line[: max(width - 4, 1)] + "..."
-    print("\r" + line.ljust(max(width - 1, 1)), end="\n" if final else "", flush=True)
-
-
-def _task_start_message(task: Mapping[str, Any], index: int, total: int) -> str:
-    return (
-        f"  START {index}/{total} "
-        f"phase={task.get('phase')} scheme={task.get('scheme')} "
-        f"window={task.get('win_start')}~{task.get('win_end')} "
-        f"gid={task.get('gid')} params={task.get('params')}"
-    )
-
-
-def _log_task_start(task: Mapping[str, Any], index: int, total: int):
-    _clear_status_line()
-    print(_task_start_message(task, index, total), flush=True)
-
-
-def _pit_memory_estimate_bytes(pit: Any) -> int:
-    if not pit:
-        return 0
-    try:
-        total = 0
-        for key, codes in pit.items():
-            total += 64 + len(str(key))
-            total += sum(64 + len(str(code)) for code in codes)
-        return int(total)
-    except Exception:
-        return 0
-
-
-def _read_cache_memory_estimate(cache_paths: CachePaths) -> int:
-    if cache_paths.data.exists():
-        try:
-            from betalens.factor.mining_cache import estimated_resident_bytes
-
-            return estimated_resident_bytes(cache_paths.data)
-        except Exception:
-            pass
-    return 0
-
-
-def _estimate_worker_memory_bytes(config: Any, cache_paths: CachePaths) -> int:
-    cache_bytes = _read_cache_memory_estimate(cache_paths)
-    overhead = int(getattr(config, "worker_memory_overhead_bytes", DEFAULT_WORKER_MEMORY_OVERHEAD_BYTES))
-    return max(1, int(cache_bytes + max(overhead, 0)))
-
-
-def _effective_workers_for_memory(config: Any, cache_paths: CachePaths) -> int:
-    requested = max(1, int(getattr(config, "workers", 1)))
-
-    budget = _memory_budget_bytes(config)
-    if not budget:
-        return requested
-
-    per_worker = _estimate_worker_memory_bytes(config, cache_paths)
-    if per_worker > budget:
-        raise MemoryError(
-            "estimated memory for one mining worker "
-            f"({_format_bytes(per_worker)}) exceeds configured cap "
-            f"({_format_bytes(budget)}). Increase max_memory_ratio/"
-            "max_memory_bytes, reduce cache size, or use a smaller universe/window."
-        )
-    allowed = max(1, int(budget // per_worker))
-    effective = max(1, min(requested, allowed))
-    total_mem, _ = _system_memory_snapshot()
-    ratio = float(getattr(config, "max_memory_ratio", DEFAULT_MAX_MEMORY_RATIO))
-    print(
-        "  memory cap: "
-        f"{_format_bytes(budget)}"
-        f" ({min(max(ratio, 0.0), 1.0):.0%} of {_format_bytes(total_mem)}), "
-        f"estimated/worker={_format_bytes(per_worker)}, "
-        f"workers={effective}/{requested}"
-    )
-    if effective < requested:
-        print("  memory guard reduced workers to stay within the configured cap")
-    return effective
-
-
-def _date_min(*spans: tuple[str, str]) -> str:
-    return min(pd.Timestamp(span[0]) for span in spans).strftime("%Y-%m-%d")
-
-
-def _date_max(*spans: tuple[str, str]) -> str:
-    return max(pd.Timestamp(span[1]) for span in spans).strftime("%Y-%m-%d")
-
-
-def _call_module_function(module_name: str, function_name: str, *args, **kwargs):
-    if "." in function_name:
-        target_module, target_function = function_name.rsplit(".", 1)
-        module = importlib.import_module(target_module)
-        return getattr(module, target_function)(*args, **kwargs)
-    module = importlib.import_module(module_name)
-    return getattr(module, function_name)(*args, **kwargs)
-
-
-def _load_spec(module_name: str, spec_factory: str, params: Mapping[str, Any]):
-    return _call_module_function(module_name, spec_factory, params)
-
-
-def _resolve_gid(module_name: str, gid_factory: str | None, params: Mapping[str, Any]) -> str:
-    if gid_factory:
-        return str(_call_module_function(module_name, gid_factory, params))
-    return default_gid(params)
-
-
-def default_gid(params: Mapping[str, Any]) -> str:
-    parts = []
-    for key, value in params.items():
-        if isinstance(value, (tuple, list)):
-            value_s = "-".join(str(v) for v in value)
-        elif isinstance(value, bool):
-            value_s = "T" if value else "F"
+    def format(self, record: logging.LogRecord) -> str:
+        record.level_cn = self._LEVEL_NAMES.get(record.levelno, record.levelname)
+        process_name = str(record.processName)
+        if process_name == "MainProcess":
+            record.process_cn = "主进程"
         else:
-            value_s = str(value)
-        parts.append(f"{key}{value_s}")
-    return "_".join(parts)
+            suffix = process_name.rsplit("-", 1)[-1]
+            record.process_cn = f"工作进程-{suffix}" if suffix.isdigit() else f"工作进程 {process_name}"
+        return super().format(record)
 
 
-def build_grid_combos(
-    grid: Mapping[str, Sequence[Any]],
+def _stage_name(stage: str) -> str:
+    return {"coarse": "粗搜", "fine": "细搜"}.get(str(stage).lower(), str(stage))
+
+
+def _mode_name(mode: str) -> str:
+    return {
+        "precomputed": "预计算",
+        "rolling_fit": "滚动拟合",
+    }.get(str(mode).lower(), str(mode))
+
+
+def _backend_name(backend: str) -> str:
+    return {"process": "多进程", "serial": "单进程"}.get(str(backend).lower(), str(backend))
+
+
+def _engine_name(engine: str) -> str:
+    return {"vector": "向量回测", "exact": "精确回测"}.get(str(engine).lower(), str(engine))
+
+
+def _metric_name(metric: str) -> str:
+    return {
+        "sharpe": "夏普比率",
+        "ann_ret": "年化收益率",
+        "mdd": "最大回撤",
+        "calmar": "卡玛比率",
+        "turnover": "换手率",
+        "rank_ic": "Rank IC",
+    }.get(str(metric).lower(), str(metric))
+
+
+def _aggregate_name(aggregate: str) -> str:
+    return {
+        "mean": "均值",
+        "median": "中位数",
+        "min": "最小值",
+        "max": "最大值",
+        "p25": "25%分位数",
+    }.get(str(aggregate).lower(), str(aggregate))
+
+
+def _direction_name(direction: str) -> str:
+    return {"maximize": "越大越好", "minimize": "越小越好"}.get(str(direction).lower(), str(direction))
+
+
+def _yes_no(value: Any) -> str:
+    return "是" if bool(value) else "否"
+
+
+def _window_description(window_id: str) -> str:
+    parts = str(window_id).split("/")
+    if len(parts) == 3 and all(part.isdigit() for part in parts):
+        length, step, index = map(int, parts)
+        return f"{length}日窗口、每{step}日滑动、第{index + 1}个窗口"
+    return str(window_id)
+
+
+def _operation_name(operation: str) -> str:
+    return {
+        "data.query": "查询行情数据",
+        "candidate.factor": "计算候选因子",
+        "candidate.weights": "生成候选权重",
+        "candidate.nav": "计算候选全程净值",
+        "candidate.fit_window": "拟合窗口参数",
+        "candidate.window_nav": "计算窗口净值",
+    }.get(operation, operation)
+
+
+def _heartbeat_fields(fields: Mapping[str, Any]) -> str:
+    labels = {
+        "stage": "搜索阶段",
+        "candidate": "候选",
+        "window": "窗口",
+        "engine": "回测引擎",
+        "table": "数据表",
+        "metric": "字段",
+    }
+    values = []
+    for key, value in fields.items():
+        if key == "stage":
+            value = _stage_name(str(value))
+        elif key == "window":
+            value = _window_description(str(value))
+        elif key == "engine":
+            value = _engine_name(str(value))
+        values.append(f"{labels.get(key, key)}={value}")
+    return "，".join(values)
+
+
+def _configure_mining_logging(
+    output_dir: Path,
+    run_id: str,
+    level: int,
     *,
-    factor_module: str | None = None,
-    gid_factory: str | None = None,
-) -> list[dict[str, Any]]:
-    keys = list(grid)
-    combos = []
-    for values in itertools.product(*(grid[key] for key in keys)):
-        params = dict(zip(keys, values))
-        gid = _resolve_gid(factor_module, gid_factory, params) if factor_module else default_gid(params)
-        combos.append({"gid": gid, "params": params})
-    return combos
+    task_logs: bool,
+    heartbeat_seconds: float,
+) -> Path:
+    """Attach one live console and one run-specific audit file handler."""
+    global _HEARTBEAT_SECONDS, _TASK_LOGS
+    _TASK_LOGS = bool(task_logs)
+    _HEARTBEAT_SECONDS = max(0.0, float(heartbeat_seconds))
+    for handler in list(_LOGGER.handlers):
+        if getattr(handler, "_betalens_mining_handler", False):
+            _LOGGER.removeHandler(handler)
+            handler.close()
+    log_dir = output_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    audit_path = log_dir / f"mining_{run_id}.log"
+    formatter = _ChineseLogFormatter(
+        "%(asctime)s %(level_cn)-2s [%(process_cn)s PID=%(process)d] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    console = logging.StreamHandler(sys.stdout)
+    audit = logging.FileHandler(audit_path, encoding="utf-8")
+    for handler in (console, audit):
+        handler.setLevel(level)
+        handler.setFormatter(formatter)
+        handler._betalens_mining_handler = True
+        _LOGGER.addHandler(handler)
+    _LOGGER.setLevel(level)
+    _LOGGER.propagate = False
+    return audit_path
 
 
-def gen_rolling_windows(
-    start: str,
-    end: str,
-    win_len: int,
-    step: int,
-    cap: int | None = None,
-) -> list[tuple[str, str]]:
-    from betalens.datafeed import get_absolute_trade_days
-
-    days = sorted(get_absolute_trade_days(start, end, "D"))
-    windows = []
-    i = 0
-    while i + win_len <= len(days):
-        s = days[i]
-        e = days[i + win_len - 1]
-        windows.append((s.strftime("%Y-%m-%d"), e.strftime("%Y-%m-%d")))
-        i += step
-    if cap and len(windows) > cap:
-        return [windows[0], windows[-1]] if cap == 2 else windows[:cap]
-    return windows
+def _close_mining_logging() -> None:
+    global _ACTIVE_RUN_MANIFEST, _ACTIVE_RUN_MANIFEST_PATH, _HEARTBEAT_SECONDS, _TASK_LOGS
+    for handler in list(_LOGGER.handlers):
+        if getattr(handler, "_betalens_mining_handler", False):
+            handler.flush()
+            _LOGGER.removeHandler(handler)
+            handler.close()
+    _TASK_LOGS = False
+    _HEARTBEAT_SECONDS = 30.0
+    _ACTIVE_RUN_MANIFEST = None
+    _ACTIVE_RUN_MANIFEST_PATH = None
 
 
-def gen_rolling_train_test_windows(
-    start: str,
-    end: str,
-    train_len: int,
-    test_len: int,
-    step: int,
-    cap: int | None = None,
-) -> list[tuple[str, str, str, str]]:
-    """Generate contiguous rolling train/test pairs without look-ahead.
+def _configure_worker_logging(
+    log_queue,
+    level: int,
+    task_logs: bool,
+    heartbeat_seconds: float,
+) -> None:
+    global _HEARTBEAT_SECONDS, _TASK_LOGS
+    _TASK_LOGS = bool(task_logs)
+    _HEARTBEAT_SECONDS = max(0.0, float(heartbeat_seconds))
+    for handler in list(_LOGGER.handlers):
+        _LOGGER.removeHandler(handler)
+    _LOGGER.addHandler(QueueHandler(log_queue))
+    _LOGGER.setLevel(level)
+    _LOGGER.propagate = False
 
-    The test interval starts on the first trading day after its paired train
-    interval.  Both intervals then advance by ``step`` trading days.  The
-    helper deliberately works on absolute trading days, matching
-    :func:`gen_rolling_windows` and the rest of the mining engine.
-    """
-    from betalens.datafeed import get_absolute_trade_days
 
-    train_len = int(train_len)
-    test_len = int(test_len)
-    step = int(step)
-    if train_len < 1 or test_len < 1 or step < 1:
-        raise ValueError("train_len, test_len and step must be positive")
-    days = sorted(get_absolute_trade_days(start, end, "D"))
-    windows = []
-    i = 0
-    while i + train_len + test_len <= len(days):
-        train_start = days[i]
-        train_end = days[i + train_len - 1]
-        test_start = days[i + train_len]
-        test_end = days[i + train_len + test_len - 1]
-        windows.append(
-            (
-                train_start.strftime("%Y-%m-%d"),
-                train_end.strftime("%Y-%m-%d"),
-                test_start.strftime("%Y-%m-%d"),
-                test_end.strftime("%Y-%m-%d"),
+def _elapsed(started: float) -> str:
+    return _human_duration(time.perf_counter() - started)
+
+
+def _human_duration(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    if seconds < 60:
+        return f"{seconds:.1f}秒"
+    minutes, remainder = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{int(minutes)}分{remainder:04.1f}秒"
+    hours, minutes = divmod(int(minutes), 60)
+    return f"{hours}小时{minutes:02d}分"
+
+
+def _human_bytes(size: int) -> str:
+    value = float(max(0, size))
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            return f"{value:.1f}{unit}"
+        value /= 1024
+    return f"{value:.1f}TiB"
+
+
+def _progress_due(completed: int, total: int, *, updates: int = 20) -> bool:
+    if completed <= 1 or completed >= total:
+        return True
+    interval = max(1, math.ceil(total / max(1, updates)))
+    return completed % interval == 0
+
+
+@contextmanager
+def _heartbeat(operation: str, **fields):
+    """Emit liveness records while a single blocking operation is running."""
+    interval = _HEARTBEAT_SECONDS
+    if interval <= 0:
+        yield
+        return
+    stopped = threading.Event()
+    started = time.perf_counter()
+    suffix = _heartbeat_fields(fields)
+
+    def report() -> None:
+        while not stopped.wait(interval):
+            _LOGGER.info(
+                "任务仍在运行：环节=%s，已耗时=%s%s",
+                _operation_name(operation),
+                _elapsed(started),
+                f"，{suffix}" if suffix else "",
             )
-        )
-        i += step
-    if cap and len(windows) > cap:
-        return [windows[0], windows[-1]] if cap == 2 else windows[:cap]
-    return windows
 
-
-def infer_warmup_days_from_params(params: Mapping[str, Any], minimum: int = 30) -> int:
-    candidates = []
-    scan_items = list(params.items())
-    for key, value in params.items():
-        if isinstance(value, Mapping):
-            scan_items.extend((f"{key}.{sub_key}", sub_value) for sub_key, sub_value in value.items())
-    for key, value in scan_items:
-        key_l = str(key).lower()
-        if key_l not in {"n"} and not any(
-            token in key_l for token in ("window", "lookback", "period", "span", "lag")
-        ):
-            continue
-        if isinstance(value, bool):
-            continue
-        if isinstance(value, (int, float)) and np.isfinite(value) and value > 1:
-            candidates.append(int(value))
+    thread = threading.Thread(target=report, name=f"mining-heartbeat-{operation}", daemon=True)
+    thread.start()
     try:
-        from betalens.factor.signal import infer_signal_warmup
+        yield
+    finally:
+        stopped.set()
+        thread.join(timeout=min(interval, 1.0))
 
-        candidates.append(infer_signal_warmup(params, minimum=minimum))
+
+@dataclass
+class MiningSpec:
+    factor_spec: Any
+    execution_mode: Literal["precomputed", "rolling_fit"] = "precomputed"
+    fit_window: Callable | None = None
+    window_transform: Callable | None = None
+    warmup_days: int | Callable = 30
+
+
+@dataclass(frozen=True)
+class MiningWindow:
+    window_id: str
+    start: str
+    end: str
+    length: int
+    step: int
+
+
+@dataclass
+class MiningData:
+    inputs: dict[str, pd.DataFrame]
+    price: pd.DataFrame
+    execution_price: pd.DataFrame
+    trade_status: pd.DataFrame | None
+    pit: dict[Any, set[str]] | None
+    universe: list[str]
+    industry_by_scheme: dict[str, pd.DataFrame] = field(default_factory=dict)
+    cache_manifest_path: str | None = None
+
+
+@dataclass
+class MiningResult:
+    coarse_window_results: pd.DataFrame
+    coarse_summary: pd.DataFrame
+    fine_window_results: pd.DataFrame
+    fine_summary: pd.DataFrame
+    selected_candidates: pd.DataFrame
+    output_dir: Path
+
+
+def _load_yaml(path: str | Path) -> dict[str, Any]:
+    import yaml
+
+    payload = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    if not isinstance(payload, dict):
+        raise ValueError(f"YAML root must be a mapping: {path}")
+    if "mining" in payload:
+        raise ValueError(
+            f"legacy `mining` section found in {path}; migrate it to parameter_space.yaml "
+            "and performance.yaml"
+        )
+    return payload
+
+
+def validate_parameter_specs(parameters: Mapping[str, Any]) -> None:
+    for name, spec in parameters.items():
+        if not isinstance(spec, Mapping):
+            raise TypeError(f"parameter {name} must be a mapping")
+        kind = str(spec.get("type", "float")).lower()
+        allowed = {"type", "low", "high", "step", "scale", "choices"}
+        unknown = sorted(set(spec) - allowed)
+        if unknown:
+            raise ValueError(f"parameter {name} has unknown fields: {unknown}")
+        if kind in {"categorical", "choice", "bool", "boolean"}:
+            choices = spec.get("choices", [False, True] if kind in {"bool", "boolean"} else None)
+            if not choices:
+                raise ValueError(f"parameter {name} requires non-empty choices")
+            continue
+        if kind not in {"int", "integer", "float"}:
+            raise ValueError(f"unsupported parameter type for {name}: {kind}")
+        if "low" not in spec or "high" not in spec:
+            raise ValueError(f"numeric parameter {name} requires low and high")
+        if float(spec["low"]) > float(spec["high"]):
+            raise ValueError(f"parameter {name} low must not exceed high")
+        scale = str(spec.get("scale", "linear")).lower()
+        if scale not in {"linear", "log"}:
+            raise ValueError(f"parameter {name} scale must be linear or log")
+        if scale == "log" and float(spec["low"]) <= 0:
+            raise ValueError(f"log parameter {name} requires low > 0")
+        if kind in {"int", "integer"} and int(spec.get("step", 1)) < 1:
+            raise ValueError(f"integer parameter {name} step must be positive")
+        if kind == "float" and spec.get("step") is not None and float(spec["step"]) <= 0:
+            raise ValueError(f"float parameter {name} step must be positive")
+        if scale == "log" and kind == "float" and spec.get("step") is not None:
+            raise ValueError(f"log float parameter {name} cannot use step")
+        if scale == "log" and kind in {"int", "integer"} and spec.get("step", 1) != 1:
+            raise ValueError(f"log integer parameter {name} requires step=1")
+
+
+def _validate_window_config(config: Mapping[str, Any]) -> tuple[list[int], list[int]]:
+    lengths = [int(value) for value in config.get("lengths", [252])]
+    steps = [int(value) for value in config.get("steps", [63])]
+    if not lengths or not steps or any(value < 1 for value in lengths + steps):
+        raise ValueError("windows.lengths and windows.steps must contain positive integers")
+    invalid = [(length, step) for length in lengths for step in steps if step > length]
+    if invalid:
+        raise ValueError(f"window step must not exceed length: {invalid}")
+    return lengths, steps
+
+
+def _candidate_id(factor_id: str, params: Mapping[str, Any]) -> str:
+    encoded = json.dumps(dict(params), ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return f"{factor_id}_{hashlib.sha1(encoded.encode('utf-8')).hexdigest()[:12]}"
+
+
+def _import_spec(module_name: str, params: Mapping[str, Any]) -> MiningSpec:
+    try:
+        module = importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if exc.name != module_name or "." in module_name:
+            raise
+        factor_root = Path(__file__).resolve().parents[2] / "betalens-factor"
+        matches = list(factor_root.rglob(f"{module_name}.py")) if factor_root.exists() else []
+        if len(matches) != 1:
+            raise ModuleNotFoundError(
+                f"cannot uniquely resolve mining module {module_name!r}; matches={len(matches)}"
+            ) from exc
+        module_directory = str(matches[0].parent)
+        if module_directory not in sys.path:
+            sys.path.insert(0, module_directory)
+        module = importlib.import_module(module_name)
+    factory = getattr(module, "make_mining_spec", None)
+    if factory is None:
+        raise AttributeError(f"{module_name} must expose make_mining_spec(params)")
+    value = factory(dict(params))
+    if not isinstance(value, MiningSpec):
+        raise TypeError(f"{module_name}.make_mining_spec(params) must return MiningSpec")
+    return value
+
+
+def _warmup_days(spec: MiningSpec, params: Mapping[str, Any]) -> int:
+    value = spec.warmup_days
+    if callable(value):
+        try:
+            value = value(params)
+        except (KeyError, TypeError, ValueError):
+            return 1200
+    return max(0, int(value))
+
+
+def _system_memory() -> tuple[int | None, int | None]:
+    try:
+        import psutil
+        info = psutil.virtual_memory()
+        return int(info.total), int(info.available)
     except Exception:
-        pass
-    if not candidates:
-        return int(minimum)
-    return max(int(minimum), int(max(candidates) * 2 + 30))
+        return None, None
 
 
-def _warmup_days(config: Any, params: Mapping[str, Any]) -> int:
-    if config.warmup_days_factory is not None:
-        return int(config.warmup_days_factory(params))
-    return infer_warmup_days_from_params(params, minimum=30)
+def _frame_bytes(value: pd.DataFrame | None) -> int:
+    if value is None:
+        return 0
+    return int(value.memory_usage(index=True, deep=True).sum())
 
 
-def fetch_daily_wide(
-    metric: str,
-    universe: Sequence[str] | None = None,
-    start_date: str | None = None,
-    end_date: str | None = None,
-    table_name: str = "daily_market",
-) -> pd.DataFrame:
+def _effective_workers(requested: int, data: MiningData, ratio: float) -> int:
+    requested = max(1, int(requested))
+    total, available = _system_memory()
+    if not total or not available or ratio <= 0:
+        return requested
+    frames = [*data.inputs.values(), data.price, data.execution_price, *data.industry_by_scheme.values()]
+    if data.trade_status is not None:
+        frames.append(data.trade_status)
+    per_worker = max(1, sum(_frame_bytes(value) for value in frames))
+    budget = min(int(total * min(float(ratio), 1.0)), int(available * 0.85))
+    return max(1, min(requested, budget // per_worker))
+
+
+def _fetch_daily_wide(metric: str, universe: Sequence[str], start: str, end: str, table: str) -> pd.DataFrame:
     from betalens.datafeed import Datafeed
 
-    data = Datafeed(table_name)
+    started = time.perf_counter()
+    _LOGGER.info(
+        "开始查询行情数据：数据表=%s，字段=%s，日期=%s 至 %s，证券数=%d",
+        table,
+        metric,
+        start,
+        end,
+        len(universe),
+    )
+    data = Datafeed(table)
     try:
-        df = data.query_time_range(
-            codes=list(universe) if universe is not None else None,
-            start_date=start_date,
-            end_date=end_date,
-            metric=metric,
-        )
+        with _heartbeat("data.query", table=table, metric=metric):
+            result = data.query_time_range(codes=list(universe), start_date=start, end_date=end, metric=metric)
     finally:
         data.close()
-    if df.empty:
+    if result.empty:
+        _LOGGER.warning(
+            "行情数据查询结果为空：数据表=%s，字段=%s，耗时=%s",
+            table,
+            metric,
+            _elapsed(started),
+        )
         return pd.DataFrame()
-    df["value"] = pd.to_numeric(df["value"], errors="coerce")
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    return df.pivot_table(index="datetime", columns="code", values="value").sort_index()
+    result["value"] = pd.to_numeric(result["value"], errors="coerce")
+    result["datetime"] = pd.to_datetime(result["datetime"])
+    wide = result.pivot_table(index="datetime", columns="code", values="value").sort_index()
+    _LOGGER.info(
+        "行情数据查询完成：数据表=%s，字段=%s，原始记录=%d行，宽表=%d行 x %d列，耗时=%s",
+        table,
+        metric,
+        len(result),
+        wide.shape[0],
+        wide.shape[1],
+        _elapsed(started),
+    )
+    return wide
 
 
-def align_daily_wides(wides: Mapping[str, pd.DataFrame | None]) -> dict[str, pd.DataFrame | None]:
-    """Align market panels to one canonical timestamp per calendar day.
-
-    ``daily_market`` metrics are not guaranteed to be stored at the same
-    intraday timestamp (for example, open at 09:30 and close/returns at
-    15:00).  Alpha formulas operate on a panel, so keeping those native
-    timestamps would make binary operators compare differently labelled
-    frames.  Pick the latest timestamp observed on each day across all
-    non-empty panels, normalize every panel to calendar dates, and restore
-    that canonical timestamp index.
-    """
-    nonempty = [wide for wide in wides.values() if wide is not None and not wide.empty]
+def _align_daily_wides(wides: Mapping[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+    nonempty = [value for value in wides.values() if value is not None and not value.empty]
     if not nonempty:
         return dict(wides)
-
-    latest_by_day: dict[pd.Timestamp, pd.Timestamp] = {}
+    latest: dict[pd.Timestamp, pd.Timestamp] = {}
     for wide in nonempty:
-        for ts in pd.DatetimeIndex(wide.index):
-            stamp = pd.Timestamp(ts)
-            day = stamp.normalize()
-            previous = latest_by_day.get(day)
-            if previous is None or stamp > previous:
-                latest_by_day[day] = stamp
-    days = pd.DatetimeIndex(sorted(latest_by_day))
-    canonical_index = pd.DatetimeIndex([latest_by_day[day] for day in days])
-
-    aligned: dict[str, pd.DataFrame | None] = {}
+        for value in pd.DatetimeIndex(wide.index):
+            day = value.normalize()
+            if day not in latest or value > latest[day]:
+                latest[day] = value
+    days = pd.DatetimeIndex(sorted(latest))
+    canonical = pd.DatetimeIndex([latest[day] for day in days])
+    output = {}
     for name, wide in wides.items():
-        if wide is None or wide.empty:
-            aligned[name] = wide
-            continue
-        frame = wide.copy()
-        frame.index = pd.DatetimeIndex(frame.index).normalize()
-        frame = frame.loc[~frame.index.duplicated(keep="last")].reindex(days)
-        frame.index = canonical_index
-        aligned[name] = frame
-    return aligned
+        value = wide.copy()
+        value.index = pd.DatetimeIndex(value.index).normalize()
+        value = value.loc[~value.index.duplicated(keep="last")].reindex(days)
+        value.index = canonical
+        output[name] = value
+    return output
 
 
-def fetch_industry_wide(
-    scheme: str,
-    universe: Sequence[str] | None,
-    dates,
-    reference_index: pd.DatetimeIndex | None = None,
-    chunk_size: int = 30,
-) -> pd.DataFrame:
-    """Fetch a PIT industry label panel aligned to a market wide index."""
-    if not universe or not dates:
-        return pd.DataFrame(index=reference_index, columns=universe or [], dtype=object)
-
+def _fetch_industry_wide(scheme: str, universe: Sequence[str], dates: Sequence[Any], index: pd.DatetimeIndex) -> pd.DataFrame:
     from betalens.datafeed import Datafeed
 
+    started = time.perf_counter()
     pieces = []
     data = Datafeed("industry")
     try:
-        day_list = list(dict.fromkeys(pd.Timestamp(day).date() for day in dates))
-        for offset in range(0, len(day_list), int(chunk_size)):
-            frame = data.query_industry(
-                codes=list(universe),
-                dates=day_list[offset : offset + int(chunk_size)],
-                scheme=scheme,
-            )
-            if frame is not None and not frame.empty:
-                pieces.append(frame[["query_date", "code", "ind_name"]])
+        days = list(dict.fromkeys(pd.Timestamp(day).date() for day in dates))
+        blocks = max(1, math.ceil(len(days) / 30))
+        _LOGGER.info(
+            "开始查询行业标签：行业体系=%s，交易日=%d，证券数=%d，分为%d批",
+            scheme,
+            len(days),
+            len(universe),
+            blocks,
+        )
+        for offset in range(0, len(days), 30):
+            value = data.query_industry(codes=list(universe), dates=days[offset:offset + 30], scheme=scheme)
+            if value is not None and not value.empty:
+                pieces.append(value[["query_date", "code", "ind_name"]])
+            completed = offset // 30 + 1
+            if _progress_due(completed, blocks, updates=10):
+                _LOGGER.info(
+                    "行业标签查询进度：行业体系=%s，已完成%d/%d批，耗时=%s",
+                    scheme,
+                    completed,
+                    blocks,
+                    _elapsed(started),
+                )
     finally:
         data.close()
-
     if not pieces:
-        return pd.DataFrame(index=reference_index, columns=universe, dtype=object)
+        _LOGGER.warning("行业标签查询结果为空：行业体系=%s，耗时=%s", scheme, _elapsed(started))
+        return pd.DataFrame(index=index, columns=universe, dtype=object)
     labels = pd.concat(pieces, ignore_index=True)
     labels["query_date"] = pd.to_datetime(labels["query_date"]).dt.normalize()
-    pivot = labels.pivot_table(
-        index="query_date", columns="code", values="ind_name", aggfunc="last"
+    pivot = labels.pivot_table(index="query_date", columns="code", values="ind_name", aggfunc="last")
+    output = pivot.reindex(index=index.normalize(), columns=universe)
+    output.index = index
+    _LOGGER.info(
+        "行业标签查询完成：行业体系=%s，结果=%d行 x %d列，耗时=%s",
+        scheme,
+        output.shape[0],
+        output.shape[1],
+        _elapsed(started),
     )
-    if reference_index is None:
-        return pivot.reindex(columns=universe).sort_index()
-    normalized = pd.DatetimeIndex(reference_index).normalize()
-    out = pivot.reindex(index=normalized, columns=universe)
-    out.index = pd.DatetimeIndex(reference_index)
-    return out
+    return output
 
 
-def fetch_trade_status_wide(
-    universe: Sequence[str],
-    dates: Sequence[Any],
-    *,
-    chunk_size: int = 120,
-) -> pd.DataFrame:
-    """Fetch full PIT trade status in bounded date chunks."""
+def _fetch_trade_status(universe: Sequence[str], dates: Sequence[Any]) -> pd.DataFrame:
     from betalens.datafeed import Datafeed
 
-    normalized = pd.DatetimeIndex(sorted({pd.Timestamp(value).normalize() for value in dates}))
-    columns = [str(code) for code in universe]
-    result = pd.DataFrame(-1, index=normalized, columns=columns, dtype=np.int8)
+    started = time.perf_counter()
+    index = pd.DatetimeIndex(sorted({pd.Timestamp(value).normalize() for value in dates}))
+    result = pd.DataFrame(-1, index=index, columns=list(universe), dtype=np.int8)
     data = Datafeed("trade_status")
     try:
-        for offset in range(0, len(normalized), max(1, int(chunk_size))):
-            block = normalized[offset:offset + max(1, int(chunk_size))]
-            status = data.query_trade_status({
-                "codes": columns,
-                "dates": [day.strftime("%Y-%m-%d") for day in block],
-            })
-            if status is None or status.empty:
+        blocks = max(1, math.ceil(len(index) / 120))
+        _LOGGER.info(
+            "开始查询交易状态：交易日=%d，证券数=%d，分为%d批",
+            len(index),
+            len(universe),
+            blocks,
+        )
+        for offset in range(0, len(index), 120):
+            block = index[offset:offset + 120]
+            value = data.query_trade_status({"codes": list(universe), "dates": [day.strftime("%Y-%m-%d") for day in block]})
+            if value is None or value.empty:
                 continue
-            status = status.copy()
-            status["day"] = pd.to_datetime(status["datetime"]).dt.normalize()
-            wide = status.pivot_table(index="day", columns="code", values="value", aggfunc="first")
-            common_dates = result.index.intersection(wide.index)
+            value = value.copy()
+            value["day"] = pd.to_datetime(value["datetime"]).dt.normalize()
+            wide = value.pivot_table(index="day", columns="code", values="value", aggfunc="first")
+            common_days = result.index.intersection(wide.index)
             common_codes = result.columns.intersection(wide.columns)
-            result.loc[common_dates, common_codes] = wide.loc[common_dates, common_codes].astype(np.int8)
+            result.loc[common_days, common_codes] = wide.loc[common_days, common_codes].astype(np.int8)
+            completed = offset // 120 + 1
+            if _progress_due(completed, blocks, updates=10):
+                _LOGGER.info(
+                    "交易状态查询进度：已完成%d/%d批，耗时=%s",
+                    completed,
+                    blocks,
+                    _elapsed(started),
+                )
     finally:
         data.close()
+    _LOGGER.info(
+        "交易状态查询完成：结果=%d行 x %d列，耗时=%s",
+        result.shape[0],
+        result.shape[1],
+        _elapsed(started),
+    )
     return result
 
 
-def mask_wide_by_pit_universe(wide_df: pd.DataFrame, pit_universe) -> pd.DataFrame:
-    """Mask a wide panel to the PIT universe effective on each calendar date."""
-    if wide_df is None or wide_df.empty or not pit_universe:
-        return wide_df
-    mask = pd.DataFrame(False, index=wide_df.index, columns=wide_df.columns)
-    columns = set(map(str, wide_df.columns))
-    for ts in wide_df.index:
-        members = pit_universe.get(pd.Timestamp(ts).date(), set())
-        keep = list(columns.intersection(map(str, members)))
-        if keep:
-            mask.loc[ts, keep] = True
-    return wide_df.where(mask)
-
-
-def _cache_signature(config: Any, spec: Any, fetch_start: str, end: str) -> str:
-    payload = {
-        "schema": CACHE_SCHEMA_VERSION,
-        "search_hash": str(getattr(config, "search_hash", "")),
-        "fetch_start": fetch_start,
-        "end": end,
-        "table_name": getattr(spec, "table_name", "daily_market"),
-        "index_code": getattr(spec, "index_code", None),
-        "backtest_metric": getattr(spec, "backtest_metric", "收盘价(元)"),
-        "mask_inputs_by_pit": bool(getattr(spec, "mask_inputs_by_pit", False)),
-        "inputs": dict(getattr(spec, "inputs", {}) or {}),
-        "industry_inputs": dict(getattr(spec, "industry_inputs", {}) or {}),
-        "industry_scheme": getattr(spec, "industry_scheme", None),
-        "universe": list(getattr(config, "universe", None) or []),
-    }
-    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def wide_to_prequery(wide_df: pd.DataFrame, metric_name: str, signal_dates) -> pd.DataFrame:
-    date_set = set(signal_dates)
-    mask = wide_df.index.map(lambda ts: ts.date() in date_set)
-    long = wide_df.loc[mask].stack().reset_index()
-    long.columns = ["input_ts", "code", metric_name]
-    long["input_ts"] = pd.to_datetime(long["input_ts"])
-    long["datetime"] = long["input_ts"]
-    long["diff_hours"] = 0.0
-    return long
-
-
-def build_pit_universe(signal_dates, index_code: str, table_name: str = "index_universe"):
+def _build_pit(dates: Sequence[Any], index_code: str) -> dict[Any, set[str]]:
     from betalens.datafeed import Datafeed
 
-    data = Datafeed(table_name)
-    pit = {}
+    started = time.perf_counter()
+    data = Datafeed("index_universe")
+    result = {}
     try:
-        for d in signal_dates:
-            date_str = pd.Timestamp(d).strftime("%Y-%m-%d")
-            pit[d] = set(data.get_index_universe(index_code, date_str))
+        total = len(dates)
+        _LOGGER.info("开始构建时点证券池：指数=%s，交易日=%d", index_code, total)
+        for position, day in enumerate(dates, 1):
+            stamp = pd.Timestamp(day)
+            result[stamp.date()] = set(data.get_index_universe(index_code, stamp.strftime("%Y-%m-%d")))
+            if _progress_due(position, total, updates=20):
+                _LOGGER.info(
+                    "时点证券池构建进度：指数=%s，已完成%d/%d日，当前日期=%s，耗时=%s",
+                    index_code,
+                    position,
+                    total,
+                    stamp.strftime("%Y-%m-%d"),
+                    _elapsed(started),
+                )
     finally:
         data.close()
-    return pit
+    securities = len({code for values in result.values() for code in values})
+    _LOGGER.info(
+        "时点证券池构建完成：指数=%s，交易日=%d，证券总数=%d，耗时=%s",
+        index_code,
+        len(result),
+        securities,
+        _elapsed(started),
+    )
+    return result
 
 
-def filter_long_by_pit_universe(long_df: pd.DataFrame, pit_universe) -> pd.DataFrame:
-    if not pit_universe or long_df.empty:
-        return long_df
+def _mask_pit(wide: pd.DataFrame, pit: Mapping[Any, set[str]] | None) -> pd.DataFrame:
+    if wide.empty or not pit:
+        return wide
+    mask = pd.DataFrame(False, index=wide.index, columns=wide.columns)
+    columns = set(map(str, wide.columns))
+    for stamp in wide.index:
+        keep = list(columns.intersection(map(str, pit.get(pd.Timestamp(stamp).date(), set()))))
+        if keep:
+            mask.loc[stamp, keep] = True
+    return wide.where(mask)
 
-    def _keep(row):
-        members = pit_universe.get(row["input_ts"].date())
-        return bool(members) and row["code"] in members
 
-    return long_df.loc[long_df.apply(_keep, axis=1)].reset_index(drop=True)
+def _pit_fingerprint(pit: Mapping[Any, set[str]] | None) -> str | None:
+    if not pit:
+        return None
+    digest = hashlib.sha256()
+    for day in sorted(pit, key=lambda value: pd.Timestamp(value)):
+        digest.update(str(pd.Timestamp(day).date()).encode("utf-8"))
+        digest.update(b"\0")
+        for code in sorted(map(str, pit[day])):
+            digest.update(code.encode("utf-8"))
+            digest.update(b"\0")
+    return digest.hexdigest()
 
 
-def _resolve_groups(spec: Any, n_quantiles: int) -> tuple[list[Any], list[Any]]:
-    long_groups = getattr(spec, "long_groups", None)
-    short_groups = getattr(spec, "short_groups", None)
-    if getattr(spec, "weight_mode", "freeplay") == "classic-long-short":
-        return [n_quantiles - 1], [0]
-    long_groups = long_groups or []
-    short_groups = short_groups or []
+def _cache_signature(
+    spec: MiningSpec,
+    start: str,
+    end: str,
+    performance: Mapping[str, Any],
+    universe: Sequence[str],
+    pit: Mapping[Any, set[str]] | None,
+) -> str:
+    factor = spec.factor_spec
+    cache_config = performance.get("cache", {}) or {}
+    payload = {
+        "schema": 4,
+        "dataset_version": cache_config.get("dataset_version", "default"),
+        "start": start,
+        "end": end,
+        "table": getattr(factor, "table_name", "daily_market"),
+        "index_code": getattr(factor, "index_code", None),
+        "inputs": dict(getattr(factor, "inputs", {}) or {}),
+        "industry_inputs": dict(getattr(factor, "industry_inputs", {}) or {}),
+        "industry_scheme": getattr(factor, "industry_scheme", None),
+        "execution_price_field": getattr(factor, "backtest_metric", "收盘价(元)"),
+        "valuation_price_field": "收盘价(元)",
+        "universe": sorted(map(str, universe)),
+        "pit_fingerprint": _pit_fingerprint(pit),
+    }
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _pit_from_frame(value: pd.DataFrame | None) -> dict[Any, set[str]] | None:
+    if value is None or value.empty:
+        return None
+    return {pd.Timestamp(day).date(): set(value.columns[value.loc[day].fillna(False).astype(bool)]) for day in value.index}
+
+
+def _slice_frame(value: pd.DataFrame | None, start: Any, end: Any) -> pd.DataFrame | None:
+    if value is None or value.empty:
+        return value
+    index = pd.DatetimeIndex(value.index).normalize()
+    keep = (index >= pd.Timestamp(start).normalize()) & (index <= pd.Timestamp(end).normalize())
+    return value.loc[keep]
+
+
+def _slice_data(data: MiningData, start: Any, end: Any) -> MiningData:
+    start_day, end_day = pd.Timestamp(start).date(), pd.Timestamp(end).date()
+    pit = None
+    if data.pit is not None:
+        pit = {
+            day: values
+            for day, values in data.pit.items()
+            if start_day <= pd.Timestamp(day).date() <= end_day
+        }
+    return MiningData(
+        inputs={name: _slice_frame(value, start, end) for name, value in data.inputs.items()},
+        price=_slice_frame(data.price, start, end),
+        execution_price=_slice_frame(data.execution_price, start, end),
+        trade_status=_slice_frame(data.trade_status, start, end),
+        pit=pit,
+        universe=list(data.universe),
+        industry_by_scheme={
+            name: _slice_frame(value, start, end)
+            for name, value in data.industry_by_scheme.items()
+        },
+        cache_manifest_path=data.cache_manifest_path,
+    )
+
+
+def _load_cached_data(manifest_path: str | Path) -> MiningData:
+    from betalens.factor.mining_cache import MiningCache
+
+    started = time.perf_counter()
+    _LOGGER.info("开始加载共享缓存：清单=%s", manifest_path)
+    cache = MiningCache(manifest_path)
+    manifest = cache.manifest
+    pit_frame = cache.load("pit") if manifest.get("pit") else None
+    loaded = MiningData(
+        inputs={name: cache.load(name) for name in manifest.get("inputs", {})},
+        price=cache.load("price"),
+        execution_price=cache.load("execution_price"),
+        trade_status=cache.load("trade_status") if manifest.get("trade_status") else None,
+        pit=_pit_from_frame(pit_frame),
+        universe=cache.universe,
+        industry_by_scheme={
+            name: cache.load(name)
+            for name in manifest.get("industry_by_scheme", {})
+        },
+        cache_manifest_path=str(cache.manifest_path),
+    )
+    resident = sum(
+        _frame_bytes(value)
+        for value in [
+            *loaded.inputs.values(),
+            loaded.price,
+            loaded.execution_price,
+            loaded.trade_status,
+            *loaded.industry_by_scheme.values(),
+        ]
+    )
+    _LOGGER.info(
+        "共享缓存加载完成：数据集=%d，证券数=%d，驻留内存约=%s，耗时=%s",
+        len(loaded.inputs) + len(loaded.industry_by_scheme) + 3,
+        len(loaded.universe),
+        _human_bytes(resident),
+        _elapsed(started),
+    )
+    return loaded
+
+
+def _fetch_data(spec: MiningSpec, span: tuple[str, str], performance: Mapping[str, Any], params: Mapping[str, Any]) -> MiningData:
+    from betalens.datafeed import get_absolute_trade_days
+
+    started = time.perf_counter()
+    factor = spec.factor_spec
+    fetch_start = (pd.Timestamp(span[0]) - pd.Timedelta(days=_warmup_days(spec, params))).strftime("%Y-%m-%d")
+    end = str(span[1])
+    _LOGGER.info(
+        "开始准备因子数据：因子=%s，评分区间=%s 至 %s，取数区间=%s 至 %s，预热天数=%d",
+        getattr(factor, "name", "factor"),
+        span[0],
+        span[1],
+        fetch_start,
+        end,
+        _warmup_days(spec, params),
+    )
+    days = list(sorted(get_absolute_trade_days(fetch_start, end, "D")))
+    _LOGGER.info("交易日历准备完成：共%d个交易日", len(days))
+    universe = list(performance.get("universe") or [])
+    pit = None
+    if getattr(factor, "index_code", None):
+        pit = _build_pit(days, getattr(factor, "index_code"))
+        universe = sorted({str(code) for values in pit.values() for code in values})
+    if not universe:
+        raise ValueError("a mining factor requires factor_spec.index_code or performance.universe")
+    _LOGGER.info("证券池准备完成：共%d只证券", len(universe))
+
+    def builder():
+        build_started = time.perf_counter()
+        input_specs = dict(getattr(factor, "inputs", {}) or {})
+        _LOGGER.info("开始准备缓存数据：因子输入字段=%d个", len(input_specs))
+        raw = {}
+        for position, (name, metric) in enumerate(input_specs.items(), 1):
+            _LOGGER.info(
+                "开始读取因子输入：输入名=%s，字段=%s，进度=%d/%d",
+                name,
+                metric,
+                position,
+                len(input_specs),
+            )
+            raw[name] = _fetch_daily_wide(
+                metric,
+                universe,
+                fetch_start,
+                end,
+                getattr(factor, "table_name", "daily_market"),
+            )
+        raw = _align_daily_wides(raw)
+        inputs = {name: _mask_pit(value, pit) if getattr(factor, "mask_inputs_by_pit", False) else value for name, value in raw.items()}
+        execution = _fetch_daily_wide(getattr(factor, "backtest_metric", "收盘价(元)"), universe, fetch_start, end, getattr(factor, "table_name", "daily_market"))
+        price = _fetch_daily_wide("收盘价(元)", universe, fetch_start, end, getattr(factor, "table_name", "daily_market"))
+        reference = next(iter(inputs.values()), price).index
+        industry = {}
+        schemes = dict(getattr(factor, "industry_inputs", {}) or {})
+        if getattr(factor, "use_industry", False):
+            schemes.setdefault("__neutralize_industry", getattr(factor, "industry_scheme", "申万一级行业"))
+        for name, scheme in schemes.items():
+            value = _fetch_industry_wide(scheme, universe, days, reference)
+            if name == "__neutralize_industry":
+                industry[scheme] = value
+            else:
+                inputs[name] = value
+        payload = {
+            "inputs": inputs,
+            "price": price,
+            "execution_price": execution,
+            "trade_status": _fetch_trade_status(universe, days),
+            "industry_by_scheme": industry,
+            "pit": pit,
+            "universe": universe,
+            "metadata": {"span": [fetch_start, end], "factor": getattr(factor, "name", "factor")},
+        }
+        _LOGGER.info(
+            "缓存数据准备完成：因子输入=%d个，行业数据=%d个，耗时=%s",
+            len(inputs),
+            len(industry),
+            _elapsed(build_started),
+        )
+        return payload
+
+    cache_config = performance.get("cache", {}) or {}
+    if not bool(cache_config.get("enabled", True)):
+        _LOGGER.info("缓存已关闭，将直接从数据源查询")
+        payload = builder()
+        loaded = MiningData(**{name: payload[name] for name in ("inputs", "price", "execution_price", "trade_status", "pit", "universe", "industry_by_scheme")})
+        _LOGGER.info("因子数据准备完成：来源=直接查询，耗时=%s", _elapsed(started))
+        return loaded
+    from betalens.factor.mining_cache import CacheRequest, MiningCache
+    directory = cache_config.get("directory") or Path(performance.get("output", {}).get("directory", "outputs/mining")) / "_cache"
+    cache = MiningCache.open_or_build(
+        CacheRequest(
+            directory,
+            _cache_signature(spec, fetch_start, end, performance, universe, pit),
+            bool(cache_config.get("rebuild", False)),
+        ),
+        builder=builder,
+    )
+    loaded = _load_cached_data(cache.manifest_path)
+    _LOGGER.info("因子数据准备完成：来源=共享缓存，耗时=%s", _elapsed(started))
+    return loaded
+
+
+def _windows(span: tuple[str, str], lengths: Sequence[int], steps: Sequence[int]) -> list[MiningWindow]:
+    from betalens.datafeed import get_absolute_trade_days
+
+    days = list(sorted(pd.Timestamp(day).normalize() for day in get_absolute_trade_days(span[0], span[1], "D")))
+    output = []
+    for length in map(int, lengths):
+        for step in map(int, steps):
+            if length < 1 or step < 1 or step > length:
+                continue
+            for number, offset in enumerate(range(0, len(days) - length + 1, step)):
+                output.append(MiningWindow(f"{length}/{step}/{number}", days[offset].strftime("%Y-%m-%d"), days[offset + length - 1].strftime("%Y-%m-%d"), length, step))
+    return output
+
+
+def _sample_days(days: Sequence[Any], frequency: str) -> list[Any]:
+    key = frequency.upper()
+    if key == "D":
+        return list(days)
+    mapping = {"W": "W", "M": "M", "Q": "Q", "S": "2Q", "Y": "Y"}
+    if key not in mapping:
+        raise ValueError(f"unsupported rebalance frequency: {frequency}")
+    values = pd.Series(pd.to_datetime(list(days)))
+    return [value.date() for value in values.groupby(values.dt.to_period(mapping[key])).last()]
+
+
+def _signal_pairs(start: str, end: str, frequency: str, trade_days: Sequence[Any]) -> list[tuple[Any, Any]]:
+    days = sorted({pd.Timestamp(value).date() for value in trade_days})
+    start_day, end_day = pd.Timestamp(start).date(), pd.Timestamp(end).date()
+    rebalances = _sample_days([day for day in days if start_day <= day <= end_day], frequency)
+    lookup = {day: index for index, day in enumerate(days)}
+    return [(days[lookup[day] - 1], day) for day in rebalances if lookup.get(day, 0) > 0]
+
+
+def _weights_on_rebalance(weights: pd.DataFrame, pairs: Sequence[tuple[Any, Any]]) -> pd.DataFrame:
+    mapping = {pd.Timestamp(signal).normalize(): pd.Timestamp(rebalance).normalize() for signal, rebalance in pairs}
+    normalized = pd.DatetimeIndex(weights.index).normalize()
+    keep = normalized.isin(mapping)
+    output = weights.loc[keep].copy()
+    output.index = pd.DatetimeIndex([mapping[day] + pd.Timedelta(minutes=10) for day in normalized[keep]])
+    return output.sort_index()
+
+
+def _wide_to_long(wide: pd.DataFrame, metric: str, signal_dates: Sequence[Any]) -> pd.DataFrame:
+    dates = set(signal_dates)
+    value = wide.loc[wide.index.map(lambda stamp: stamp.date() in dates)].stack().reset_index()
+    value.columns = ["input_ts", "code", metric]
+    value["input_ts"] = pd.to_datetime(value["input_ts"])
+    value["datetime"] = value["input_ts"]
+    value["diff_hours"] = 0.0
+    return value
+
+
+def _filter_pit(value: pd.DataFrame, pit: Mapping[Any, set[str]] | None) -> pd.DataFrame:
+    if not pit or value.empty:
+        return value
+    keep = [row.code in pit.get(row.input_ts.date(), set()) for row in value.itertuples()]
+    return value.loc[keep].reset_index(drop=True)
+
+
+def _preprocess(value: pd.DataFrame, factor: Any, signal_dates: Sequence[Any], data: MiningData) -> pd.DataFrame:
+    use_industry = bool(getattr(factor, "use_industry", False))
+    use_mktcap = bool(getattr(factor, "use_mktcap", False))
+    if not (use_industry or use_mktcap):
+        return value
+    from betalens.factor.preprocessing import neutralize_factor, standardize_factor, winsorize_factor
+
+    metric = factor.name
+    value = value.dropna(subset=[metric]).copy()
+    industry_panel = None
+    if use_industry:
+        scheme = getattr(factor, "industry_scheme", "申万一级行业")
+        cached = data.industry_by_scheme.get(scheme)
+        if cached is not None and not cached.empty:
+            industry_panel = _wide_to_long(cached, "__industry", signal_dates).set_index(["input_ts", "code"])["__industry"]
+    mktcap_panel = None
+    if use_mktcap:
+        market_cap = _fetch_daily_wide("A股流通市值(元)", data.universe, str(value.input_ts.min().date()), str(value.input_ts.max().date()), getattr(factor, "table_name", "daily_market"))
+        if not market_cap.empty:
+            mktcap_panel = _wide_to_long(np.log(market_cap.replace(0, np.nan)), "__mktcap", signal_dates).set_index(["input_ts", "code"])["__mktcap"]
+    groups = []
+    for stamp, group in value.groupby("input_ts"):
+        section = group.set_index("code").copy()
+        series = standardize_factor(winsorize_factor(section[metric], method="mad", n=3.0), method="zscore")
+        industry = industry_panel.xs(stamp, level="input_ts").reindex(series.index) if industry_panel is not None and stamp in industry_panel.index.get_level_values("input_ts") else None
+        mktcap = mktcap_panel.xs(stamp, level="input_ts").reindex(series.index) if mktcap_panel is not None and stamp in mktcap_panel.index.get_level_values("input_ts") else None
+        section[metric] = neutralize_factor(series, industry_labels=industry, log_market_cap=mktcap) if industry is not None or mktcap is not None else series
+        groups.append(section.reset_index())
+    return pd.concat(groups, ignore_index=True) if groups else value.iloc[0:0]
+
+
+def _groups(factor: Any, quantiles: int) -> tuple[list[Any], list[Any]]:
+    if getattr(factor, "weight_mode", "freeplay") == "classic-long-short":
+        return [quantiles - 1], [0]
+    long_groups = list(getattr(factor, "long_groups", None) or [])
+    short_groups = list(getattr(factor, "short_groups", None) or [])
     if not long_groups and not short_groups:
         raise ValueError("freeplay mode requires long_groups or short_groups")
     return long_groups, short_groups
 
 
-def _preprocess_if_needed(
-    prequery: pd.DataFrame,
-    spec: Any,
-    signal_dates,
-    universe: Sequence[str],
-    fetch_start: str,
-    end_date: str,
-    prepared: Mapping[str, Any] | None = None,
-) -> pd.DataFrame:
-    use_industry = bool(getattr(spec, "use_industry", False))
-    use_mktcap = bool(getattr(spec, "use_mktcap", False))
-    if not (use_industry or use_mktcap):
-        return prequery
+def _build_weights(factor_wide: pd.DataFrame, spec: MiningSpec, params: Mapping[str, Any], data: MiningData, start: str, end: str, frequency: str) -> pd.DataFrame:
+    from betalens.factor.factor import get_single_factor_weight, single_characteristic
 
-    from betalens.datafeed.validation import FillStrategy, fix_null_values
-    from betalens.factor.preprocessing import (
-        neutralize_factor,
-        query_industry_panel,
-        standardize_factor,
-        winsorize_factor,
-    )
-
-    metric = spec.name
-    data = fix_null_values(prequery, strategy=FillStrategy.DROP, columns=[metric])
-    industry_scheme = getattr(spec, "industry_scheme", "申万一级行业") if use_industry else None
-    industry_panel = None
-    if industry_scheme:
-        prepared = prepared or {}
-        cached = (prepared.get("industry_by_scheme") or {}).get(industry_scheme)
-        if cached is None:
-            cached = (_CACHE_DATA or {}).get("industry_by_scheme", {}).get(industry_scheme)
-        if isinstance(cached, Mapping) and "values" in cached:
-            cached = _cache_frame(cached, fetch_start, end_date)
-        if cached is not None and not cached.empty:
-            cached_long = wide_to_prequery(cached, "__mining_industry", signal_dates)
-            if not cached_long.empty:
-                industry_panel = cached_long.set_index(["input_ts", "code"])["__mining_industry"]
-        if industry_panel is None:
-            industry_panel = query_industry_panel(
-                data, scheme=industry_scheme, industry_table="industry", verbose=False
-            )
-
-    mktcap_col = None
-    if use_mktcap:
-        mktcap_wide = fetch_daily_wide(
-            "A股流通市值(元)",
-            universe=universe,
-            start_date=fetch_start,
-            end_date=end_date,
-            table_name=getattr(spec, "table_name", "daily_market"),
-        )
-        if not mktcap_wide.empty:
-            log_mktcap = np.log(mktcap_wide.replace(0, np.nan))
-            lm_long = wide_to_prequery(log_mktcap, "log_mktcap", signal_dates)
-            data = data.merge(
-                lm_long[["input_ts", "code", "log_mktcap"]],
-                on=["input_ts", "code"],
-                how="left",
-            )
-            mktcap_col = "log_mktcap"
-
-    groups = []
-    for ts, group in data.groupby("input_ts"):
-        sub = group.copy()
-        series = sub.set_index("code")[metric]
-        series = winsorize_factor(series, method="mad", n=3.0)
-        series = standardize_factor(series, method="zscore")
-
-        industry = None
-        if industry_panel is not None and pd.Timestamp(ts) in industry_panel.index.get_level_values("input_ts"):
-            industry = industry_panel.xs(pd.Timestamp(ts), level="input_ts").reindex(series.index)
-        mktcap = sub.set_index("code")[mktcap_col] if mktcap_col and mktcap_col in sub.columns else None
-
-        if industry is not None or mktcap is not None:
-            series = neutralize_factor(series, industry_labels=industry, log_market_cap=mktcap)
-
-        sub = sub.set_index("code")
-        sub[metric] = series
-        groups.append(sub.reset_index())
-    if not groups:
-        return data.iloc[0:0]
-    return pd.concat(groups, ignore_index=True)
+    factor = spec.factor_spec
+    pairs = _signal_pairs(start, end, frequency, data.price.index)
+    signal_dates = [signal for signal, _ in pairs]
+    if getattr(factor, "weight_mode", "freeplay") in {"event", "timing"}:
+        weights = pd.DataFrame(index=pd.DatetimeIndex(signal_dates) + pd.Timedelta(minutes=10))
+    else:
+        value = _filter_pit(_wide_to_long(factor_wide, factor.name, signal_dates), data.pit)
+        value = _preprocess(value, factor, signal_dates, data)
+        if value.empty:
+            return pd.DataFrame()
+        quantiles = int(params.get("n_quantiles", 10))
+        labeled = single_characteristic(value, factor.name, {factor.name: quantiles})
+        long_groups, short_groups = _groups(factor, quantiles)
+        weights = get_single_factor_weight(labeled, {"factor_key": factor.name, "mode": getattr(factor, "weight_mode", "freeplay"), "long": long_groups, "short": short_groups})
+    return _weights_on_rebalance(weights, pairs)
 
 
 def metrics_from_nav(nav: pd.Series | pd.DataFrame) -> dict[str, Any]:
     if isinstance(nav, pd.DataFrame):
-        nav = nav.iloc[:, 0] if nav.shape[1] else pd.Series(dtype=float)
+        value = nav.iloc[:, 0] if nav.shape[1] else pd.Series(dtype=float)
     else:
-        nav = pd.Series(nav)
-    nav = nav.dropna()
-    r = nav.pct_change().dropna()
-    if len(r) < 2 or r.std() == 0:
-        return {
-            "sharpe": 0.0,
-            "ann_ret": 0.0,
-            "ann_vol": 0.0,
-            "mdd": 0.0,
-            "calmar": 0.0,
-            "n_days": int(len(r)),
-        }
-    ann_ret = (1 + r).prod() ** (252 / len(r)) - 1
-    ann_vol = r.std() * np.sqrt(252)
-    sharpe = ann_ret / ann_vol if ann_vol > 0 else 0.0
-    wealth = (1 + r).cumprod()
+        value = pd.Series(nav)
+    value = pd.Series(value).dropna()
+    returns = value.pct_change().dropna()
+    if len(returns) < 2 or returns.std() == 0:
+        return {"sharpe": 0.0, "ann_ret": 0.0, "ann_vol": 0.0, "mdd": 0.0, "calmar": 0.0, "n_days": int(len(returns))}
+    ann_ret = (1 + returns).prod() ** (252 / len(returns)) - 1
+    ann_vol = returns.std() * math.sqrt(252)
+    wealth = (1 + returns).cumprod()
     mdd = float((1 - wealth / wealth.cummax()).max())
-    calmar = ann_ret / mdd if mdd > 0 else 0.0
-    return {
-        "sharpe": round(float(sharpe), 4),
-        "ann_ret": round(float(ann_ret), 4),
-        "ann_vol": round(float(ann_vol), 4),
-        "mdd": round(mdd, 4),
-        "calmar": round(float(calmar), 4),
-        "n_days": int(len(r)),
-    }
+    return {"sharpe": round(float(ann_ret / ann_vol), 4), "ann_ret": round(float(ann_ret), 4), "ann_vol": round(float(ann_vol), 4), "mdd": round(mdd, 4), "calmar": round(float(ann_ret / mdd), 4) if mdd > 0 else 0.0, "n_days": int(len(returns))}
 
 
-def _vector_backtest(weights: pd.DataFrame, price_wide: pd.DataFrame) -> pd.Series:
-    codes = [c for c in weights.columns if c != "cash" and c in price_wide.columns]
-    if not codes or weights.empty:
-        return pd.Series([1.0])
-
-    reb_days = pd.DatetimeIndex(sorted({pd.Timestamp(ts).normalize() for ts in weights.index}))
-    px = price_wide.loc[
-        (price_wide.index >= reb_days[0]) &
-        (price_wide.index <= reb_days[-1] + pd.Timedelta(days=40)),
-        codes,
-    ]
-    if px.empty:
-        return pd.Series([1.0])
-
-    ret = px.pct_change()
-    w = weights.copy()
-    w.index = pd.DatetimeIndex(w.index).normalize()
-    w = w.reindex(columns=codes).reindex(px.index, method="ffill").shift(1).fillna(0.0)
-    port_ret = (w * ret).sum(axis=1).dropna()
-    if port_ret.empty:
-        return pd.Series([1.0])
-    return (1 + port_ret).cumprod()
+def _turnover(weights: pd.DataFrame | None) -> float:
+    if weights is None or weights.empty:
+        return 0.0
+    columns = [name for name in weights if str(name).lower() != "cash"]
+    if not columns:
+        return 0.0
+    values = weights.loc[:, columns].fillna(0.0).sort_index().reset_index(drop=True)
+    values = pd.concat([pd.DataFrame([np.zeros(len(columns))], columns=columns), values], ignore_index=True)
+    return float((0.5 * values.diff().abs().sum(axis=1).iloc[1:]).mean())
 
 
-def _init_worker(cache_data_path: str, pit_path: str):
-    global _CACHE_DATA, _PIT_UNIVERSE
-    warnings.filterwarnings("ignore")
-    from betalens.factor.mining_cache import open_manifest
-
-    _CACHE_DATA = open_manifest(cache_data_path)
-    _PIT_UNIVERSE = None
+def _daily_last(value: pd.DataFrame) -> pd.DataFrame:
+    result = value.copy()
+    result.index = pd.DatetimeIndex(result.index).normalize()
+    return result.groupby(level=0, sort=True).last()
 
 
-def _worker_private_bytes_probe(cache_data_path: str, pit_path: str) -> int:
-    """Map the real cache in a short-lived worker and report private bytes."""
-    _init_worker(cache_data_path, pit_path)
-    materialized = []
-    groups = [
-        (_CACHE_DATA or {}).get("inputs", {}),
-        (_CACHE_DATA or {}).get("industry_by_scheme", {}),
-    ]
-    descriptors = [
-        (_CACHE_DATA or {}).get("price"),
-        (_CACHE_DATA or {}).get("execution_price"),
-        (_CACHE_DATA or {}).get("trade_status"),
-        (_CACHE_DATA or {}).get("pit"),
-    ]
-    for group in groups:
-        descriptors.extend(group.values())
-    for descriptor in descriptors:
-        if not isinstance(descriptor, Mapping) or "values" not in descriptor:
-            continue
-        dates = np.asarray(descriptor["dates"])
-        if not len(dates):
-            continue
-        end = pd.Timestamp(int(dates[min(len(dates), 64) - 1]))
-        materialized.append(_cache_frame(descriptor, end=end).copy())
-    if os.name == "nt":
-        try:
-            import ctypes
-
-            class PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
-                _fields_ = [
-                    ("cb", ctypes.c_ulong),
-                    ("PageFaultCount", ctypes.c_ulong),
-                    ("PeakWorkingSetSize", ctypes.c_size_t),
-                    ("WorkingSetSize", ctypes.c_size_t),
-                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                    ("PagefileUsage", ctypes.c_size_t),
-                    ("PeakPagefileUsage", ctypes.c_size_t),
-                    ("PrivateUsage", ctypes.c_size_t),
-                ]
-
-            counters = PROCESS_MEMORY_COUNTERS_EX()
-            counters.cb = ctypes.sizeof(counters)
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            psapi = ctypes.WinDLL("psapi", use_last_error=True)
-            kernel32.GetCurrentProcess.restype = ctypes.c_void_p
-            psapi.GetProcessMemoryInfo.argtypes = [
-                ctypes.c_void_p,
-                ctypes.POINTER(PROCESS_MEMORY_COUNTERS_EX),
-                ctypes.c_ulong,
-            ]
-            psapi.GetProcessMemoryInfo.restype = ctypes.c_int
-            ok = psapi.GetProcessMemoryInfo(
-                kernel32.GetCurrentProcess(),
-                ctypes.byref(counters),
-                counters.cb,
-            )
-            if ok:
-                return int(counters.PrivateUsage)
-        except Exception:
-            pass
-    try:
-        import psutil
-
-        memory = psutil.Process(os.getpid()).memory_full_info()
-        return int(getattr(memory, "private", getattr(memory, "uss", memory.rss)))
-    except Exception:
-        return 0
-
-
-def _cache_frame(descriptor: Any, start: Any = None, end: Any = None, columns=None) -> pd.DataFrame:
-    if isinstance(descriptor, pd.DataFrame):
-        result = descriptor
-        if start is not None:
-            result = result.loc[result.index >= pd.Timestamp(start)]
-        if end is not None:
-            result = result.loc[result.index <= pd.Timestamp(end)]
-        if columns is not None:
-            result = result.loc[:, [column for column in columns if column in result.columns]]
-        return result
-    from betalens.factor.mining_cache import frame
-
-    return frame(descriptor, start=start, end=end, columns=columns)
-
-
-def _task_signal_dates(start: str, end: str, fetch_start: str, rebal_freq: str):
-    return [signal for signal, _rebalance in _task_signal_rebalance_pairs(start, end, fetch_start, rebal_freq)]
-
-
-def _sample_trade_days(days: Sequence[Any], period: str) -> list[Any]:
-    period_key = str(period).upper()
-    if period_key == "D":
-        return list(days)
-    period_map = {"W": "W", "M": "M", "Q": "Q", "S": "2Q", "Y": "Y"}
-    if period_key not in period_map:
-        raise ValueError(f"unsupported rebalance frequency: {period}")
-    values = pd.Series(pd.to_datetime(list(days)))
-    return [value.date() for value in values.groupby(values.dt.to_period(period_map[period_key])).last()]
-
-
-def _task_signal_rebalance_pairs(
-    start: str,
-    end: str,
-    fetch_start: str,
-    rebal_freq: str,
-    trade_days: Sequence[Any] | None = None,
-):
-    if trade_days is None:
-        from betalens.datafeed import get_absolute_trade_days
-
-        all_trade_days = sorted(get_absolute_trade_days(fetch_start, end, "D"))
-    else:
-        all_trade_days = sorted({pd.Timestamp(value).date() for value in trade_days})
-        fetch_day = pd.Timestamp(fetch_start).date()
-        end_day = pd.Timestamp(end).date()
-        all_trade_days = [day for day in all_trade_days if fetch_day <= day <= end_day]
-    start_day = pd.Timestamp(start).date()
-    rebalance_dates = _sample_trade_days(
-        [day for day in all_trade_days if start_day <= day <= pd.Timestamp(end).date()],
-        rebal_freq,
-    )
-    idx = {d: i for i, d in enumerate(all_trade_days)}
-    return [
-        (all_trade_days[idx[day] - 1], day)
-        for day in rebalance_dates
-        if idx.get(day, 0) > 0
-    ]
-
-
-def _weights_on_rebalance_days(
-    weights: pd.DataFrame,
-    signal_rebalance_pairs: Sequence[tuple[Any, Any]],
-) -> pd.DataFrame:
-    mapping = {
-        pd.Timestamp(signal).normalize(): pd.Timestamp(rebalance).normalize()
-        for signal, rebalance in signal_rebalance_pairs
-    }
-    normalized = pd.DatetimeIndex(weights.index).normalize()
-    keep = normalized.isin(mapping)
-    result = weights.loc[keep].copy()
-    result.index = pd.DatetimeIndex(
-        [mapping[day] + pd.Timedelta(minutes=10) for day in normalized[keep]]
-    )
-    return result.sort_index()
-
-
-def _daily_last(frame: pd.DataFrame) -> pd.DataFrame:
-    daily = frame.copy()
-    daily.index = pd.DatetimeIndex(daily.index).normalize()
-    return daily.groupby(level=0, sort=True).last()
-
-
-def robust_rank_ic_metrics(
-    factor_wide: pd.DataFrame,
-    execution_price: pd.DataFrame,
-    signal_rebalance_pairs: Sequence[tuple[Any, Any]],
-) -> dict[str, Any]:
-    """Measure prior-day signal IC against current-to-next execution returns."""
-    factor = _daily_last(factor_wide)
-    price = _daily_last(execution_price)
-    observations: list[tuple[pd.Timestamp, float]] = []
-    possible = max(0, len(signal_rebalance_pairs) - 1)
+def _rank_ic(factor: pd.DataFrame, price: pd.DataFrame, pairs: Sequence[tuple[Any, Any]]) -> dict[str, Any]:
+    factor, price = _daily_last(factor), _daily_last(price)
+    observations = []
+    possible = max(0, len(pairs) - 1)
     for index in range(possible):
-        signal_day, rebalance_day = signal_rebalance_pairs[index]
-        _next_signal, next_rebalance_day = signal_rebalance_pairs[index + 1]
-        signal_ts = pd.Timestamp(signal_day).normalize()
-        rebalance_ts = pd.Timestamp(rebalance_day).normalize()
-        next_ts = pd.Timestamp(next_rebalance_day).normalize()
-        if signal_ts not in factor.index or rebalance_ts not in price.index or next_ts not in price.index:
+        signal, rebalance = pairs[index]
+        _, next_rebalance = pairs[index + 1]
+        signal, rebalance, next_rebalance = map(lambda value: pd.Timestamp(value).normalize(), (signal, rebalance, next_rebalance))
+        if signal not in factor.index or rebalance not in price.index or next_rebalance not in price.index:
             continue
-        future_return = price.loc[next_ts] / price.loc[rebalance_ts] - 1.0
-        section = pd.concat(
-            [factor.loc[signal_ts].rename("signal"), future_return.rename("future_return")],
-            axis=1,
-        ).replace([np.inf, -np.inf], np.nan).dropna()
-        if len(section) < 3 or section["signal"].nunique() < 2 or section["future_return"].nunique() < 2:
-            continue
-        value = section["signal"].corr(section["future_return"], method="spearman")
-        if pd.notna(value):
-            observations.append((rebalance_ts, float(value)))
-
+        section = pd.concat([factor.loc[signal].rename("signal"), (price.loc[next_rebalance] / price.loc[rebalance] - 1).rename("return")], axis=1).replace([np.inf, -np.inf], np.nan).dropna()
+        if len(section) >= 3 and section.signal.nunique() > 1 and section["return"].nunique() > 1:
+            correlation = section.signal.corr(section["return"], method="spearman")
+            if pd.notna(correlation):
+                observations.append((rebalance, float(correlation)))
     coverage = len(observations) / possible if possible else 0.0
     if not observations:
-        return {
-            "robust_rank_ic": float("nan"),
-            "mean_rank_ic": float("nan"),
-            "ic_coverage": float(coverage),
-            "valid_ic_sections": 0,
-            "possible_ic_sections": int(possible),
-        }
-    monthly = (
-        pd.Series(
-            [value for _date, value in observations],
-            index=pd.DatetimeIndex([date for date, _value in observations]),
-            dtype=float,
-        )
-        .groupby(lambda value: value.to_period("M"))
-        .mean()
-    )
+        return {"rank_ic": np.nan, "robust_rank_ic": np.nan, "mean_rank_ic": np.nan, "ic_coverage": coverage}
+    monthly = pd.Series([value for _, value in observations], index=pd.DatetimeIndex([day for day, _ in observations])).groupby(lambda day: day.to_period("M")).mean()
     median = float(monthly.median())
-    mad = float((monthly - median).abs().median())
-    robust = median - 0.25 * 1.4826 * mad
-    return {
-        "robust_rank_ic": float(robust),
-        "mean_rank_ic": float(np.mean([value for _date, value in observations])),
-        "ic_coverage": float(coverage),
-        "valid_ic_sections": int(len(observations)),
-        "possible_ic_sections": int(possible),
-    }
+    robust = median - 0.25 * 1.4826 * float((monthly - median).abs().median())
+    return {"rank_ic": robust, "robust_rank_ic": robust, "mean_rank_ic": float(np.mean([value for _, value in observations])), "ic_coverage": coverage}
 
 
-def mean_one_way_turnover(weights: pd.DataFrame) -> float:
-    """Average 0.5 * absolute non-cash weight change at each rebalance."""
-    columns = [column for column in weights.columns if str(column).lower() != "cash"]
-    if not columns or weights.empty:
-        return 0.0
-    values = weights.loc[:, columns].fillna(0.0).sort_index()
-    previous = pd.DataFrame([np.zeros(len(columns))], columns=columns)
-    stacked = pd.concat([previous, values.reset_index(drop=True)], ignore_index=True)
-    return float((0.5 * stacked.diff().abs().sum(axis=1).iloc[1:]).mean())
+def _vector_nav(weights: pd.DataFrame, price: pd.DataFrame) -> pd.Series:
+    if weights is None or weights.empty or price.empty:
+        return pd.Series(dtype=float)
+    codes = [name for name in weights if name != "cash" and name in price]
+    if not codes:
+        return pd.Series(1.0, index=price.index)
+    values = weights.copy()
+    values.index = pd.DatetimeIndex(values.index).normalize()
+    values = values.reindex(columns=codes).reindex(price.index, method="ffill").shift(1).fillna(0.0)
+    return (1 + (values * price.loc[:, codes].pct_change()).sum(axis=1).fillna(0.0)).cumprod()
 
 
-def _run_one_task_impl(
-    task: dict[str, Any],
-    prepared: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
+def _exact_nav(weights: pd.DataFrame, data: MiningData, spec: MiningSpec, amount: float, tolerance: int) -> pd.Series:
     from betalens.backtest import BacktestBase
-    from betalens.factor.factor import get_single_factor_weight, single_characteristic
 
-    if _CACHE_DATA is None:
-        raise RuntimeError("mining cache is not initialized")
+    codes = [name for name in weights if name != "cash"]
+    if not codes:
+        return pd.Series(dtype=float)
+    close = data.price.loc[:, [name for name in codes if name in data.price]]
+    execution = data.execution_price.loc[:, [name for name in codes if name in data.execution_price]]
+    status = data.trade_status.loc[:, [name for name in codes if name in data.trade_status]] if data.trade_status is not None else None
+    engine = BacktestBase(weights, metric=getattr(spec.factor_spec, "backtest_metric", "收盘价(元)"), symbol=getattr(spec.factor_spec, "name", "mining"), amount=amount, time_tolerance=tolerance, table_name=getattr(spec.factor_spec, "table_name", "daily_market"), verbose=False, preloaded_cost_price=execution, preloaded_close_price=close, preloaded_trade_status=status)
+    return pd.Series(engine.nav)
 
-    params = dict(task["params"])
-    out = dict(params)
-    out.update({
-        "win_start": task["win_start"],
-        "win_end": task["win_end"],
-        "scheme": task["scheme"],
-        "phase": task["phase"],
-        "gid": task["gid"],
-    })
-    for key in ("trial_number", "study_name", "train_start", "train_end", "test_start", "test_end"):
-        if key in task:
-            out[key] = task[key]
-    if "rank" in task:
-        out["rank"] = task["rank"]
 
+def _call_fit(callback: Callable, data: MiningData, params: Mapping[str, Any], window: MiningWindow, context: Mapping[str, Any]):
     try:
-        spec = _load_spec(task["factor_module"], task["spec_factory"], params)
-        start, end = task["win_start"], task["win_end"]
-        fetch_start = (
-            pd.Timestamp(start) - pd.Timedelta(days=int(task["warmup_days"]))
-        ).strftime("%Y-%m-%d")
-        prepared = prepared or {}
-        trade_status_descriptor = prepared.get("trade_status", _CACHE_DATA.get("trade_status"))
-        cached_trade_days = (
-            pd.DatetimeIndex(np.asarray(trade_status_descriptor["dates"], dtype=np.int64))
-            if isinstance(trade_status_descriptor, Mapping) and "dates" in trade_status_descriptor
-            else None
+        return callback(data, params, window, context)
+    except TypeError:
+        try:
+            return callback(data, params, window)
+        except TypeError:
+            return callback(data, params)
+
+
+def _persist_nav(nav: pd.Series | pd.DataFrame, candidate_id: str, name: str, evaluation: Mapping[str, Any]) -> None:
+    staging = evaluation.get("_nav_staging")
+    if not staging:
+        return
+    value = nav.iloc[:, 0] if isinstance(nav, pd.DataFrame) and nav.shape[1] else pd.Series(nav)
+    value = pd.Series(value).dropna()
+    if value.empty:
+        return
+    target = Path(str(staging)) / candidate_id
+    target.mkdir(parents=True, exist_ok=True)
+    safe_name = "".join(character if character.isalnum() or character in {"-", "_"} else "_" for character in name)
+    payload = np.empty(len(value), dtype=[("datetime_ns", "<i8"), ("nav", "<f8")])
+    payload["datetime_ns"] = pd.DatetimeIndex(value.index).asi8
+    payload["nav"] = pd.to_numeric(value, errors="coerce").to_numpy(dtype=float)
+    np.save(target / f"{safe_name}.npy", payload, allow_pickle=False)
+
+
+def _publish_selected_nav(staging: Path | None, output_dir: Path, selected_ids: set[str]) -> Path | None:
+    if staging is None or not staging.exists():
+        return None
+    run_directory = output_dir / "selected_nav" / staging.name
+    if selected_ids:
+        run_directory.mkdir(parents=True, exist_ok=False)
+        for candidate_id in sorted(selected_ids):
+            source = staging / candidate_id
+            if source.exists():
+                source.replace(run_directory / candidate_id)
+    resolved_staging = staging.resolve()
+    expected_parent = (output_dir / ".nav_staging").resolve()
+    if resolved_staging.parent != expected_parent:
+        raise RuntimeError(f"refusing to clean unexpected nav staging path: {resolved_staging}")
+    shutil.rmtree(resolved_staging)
+    try:
+        expected_parent.rmdir()
+    except OSError:
+        pass
+    return run_directory if run_directory.exists() else None
+
+
+def _evaluate_candidate(module: str, factor_id: str, params: Mapping[str, Any], stage: str, windows: Sequence[MiningWindow], data: MiningData, evaluation: Mapping[str, Any]) -> list[dict[str, Any]]:
+    candidate_started = time.perf_counter()
+    params = dict(params)
+    spec = _import_spec(module, params)
+    mode = str(spec.execution_mode).lower()
+    if mode not in {"precomputed", "rolling_fit"}:
+        raise ValueError(f"unsupported execution_mode={mode}")
+    candidate = _candidate_id(factor_id, params)
+    engine = str(evaluation.get("engine", "vector")).lower()
+    amount = float(evaluation.get("initial_amount", 1e8))
+    frequency = str(evaluation.get("rebal_freq", "D"))
+    tolerance = int(evaluation.get("time_tolerance", 24))
+    if _TASK_LOGS:
+        _LOGGER.info(
+            "%s候选开始计算：因子=%s，候选=%s，执行模式=%s，回测引擎=%s，窗口数=%d，参数=%s",
+            _stage_name(stage),
+            factor_id,
+            candidate,
+            _mode_name(mode),
+            _engine_name(engine),
+            len(windows),
+            json.dumps(params, ensure_ascii=False, sort_keys=True, default=str),
         )
-        if cached_trade_days is None:
-            first_input = next(iter((_CACHE_DATA.get("inputs") or {}).values()), None)
-            if isinstance(first_input, pd.DataFrame):
-                cached_trade_days = pd.DatetimeIndex(first_input.index)
-            elif isinstance(first_input, Mapping) and "dates" in first_input:
-                cached_trade_days = pd.DatetimeIndex(
-                    np.asarray(first_input["dates"], dtype=np.int64)
+    full_factor = full_weights = full_nav = None
+    if mode == "precomputed":
+        compute_started = time.perf_counter()
+        if _TASK_LOGS:
+            _LOGGER.info("%s候选 %s：开始计算全程因子", _stage_name(stage), candidate)
+        with _heartbeat("candidate.factor", stage=stage, candidate=candidate):
+            full_factor = spec.factor_spec.compute(**data.inputs, **getattr(spec.factor_spec, "compute_kwargs", {}))
+        if _TASK_LOGS:
+            _LOGGER.info(
+                "%s候选 %s：全程因子计算完成，结果=%d行 x %d列，耗时=%s",
+                _stage_name(stage),
+                candidate,
+                full_factor.shape[0],
+                full_factor.shape[1],
+                _elapsed(compute_started),
+            )
+        weights_started = time.perf_counter()
+        with _heartbeat("candidate.weights", stage=stage, candidate=candidate):
+            full_weights = _build_weights(full_factor, spec, params, data, evaluation["span"][0], evaluation["span"][1], frequency)
+        if _TASK_LOGS:
+            _LOGGER.info(
+                "%s候选 %s：全程权重生成完成，结果=%d行 x %d列，耗时=%s",
+                _stage_name(stage),
+                candidate,
+                full_weights.shape[0],
+                full_weights.shape[1],
+                _elapsed(weights_started),
+            )
+        if spec.window_transform is None:
+            nav_started = time.perf_counter()
+            with _heartbeat("candidate.nav", stage=stage, candidate=candidate, engine=engine):
+                full_nav = _vector_nav(full_weights, data.price) if engine == "vector" else _exact_nav(full_weights, data, spec, amount, tolerance)
+            _persist_nav(full_nav, candidate, "full", evaluation)
+            if _TASK_LOGS:
+                _LOGGER.info(
+                    "%s候选 %s：全程净值回测完成，观测数=%d，耗时=%s",
+                    _stage_name(stage),
+                    candidate,
+                    len(full_nav),
+                    _elapsed(nav_started),
                 )
-        signal_rebalance_pairs = _task_signal_rebalance_pairs(
-            start,
-            end,
-            fetch_start,
-            task["rebal_freq"],
-            cached_trade_days,
-        )
-        signal_dates = [signal for signal, _rebalance in signal_rebalance_pairs]
-        if not signal_dates:
-            out["error"] = "no signal dates"
-            return out
-
-        wides = {}
-        input_names = list(dict.fromkeys([
-            *getattr(spec, "inputs", {}),
-            *getattr(spec, "industry_inputs", {}),
-        ]))
-        for arg_name in input_names:
-            wides[arg_name] = _cache_frame(
-                (prepared.get("inputs") or {}).get(arg_name, _CACHE_DATA["inputs"][arg_name]),
-                fetch_start,
-                pd.Timestamp(end) + pd.Timedelta(days=1),
-            )
-
-        factor_wide = spec.compute(**wides, **getattr(spec, "compute_kwargs", {}))
-        weight_mode = getattr(spec, "weight_mode", "freeplay")
-        universe = _CACHE_DATA.get("universe") or []
-
-        if weight_mode in ("event", "timing"):
-            if not task.get("weight_hook"):
-                raise ValueError(f"{weight_mode} weight_mode requires a mining weight_hook")
-            weights = pd.DataFrame(index=pd.DatetimeIndex(signal_dates) + pd.Timedelta(minutes=10))
-        else:
-            prequery = wide_to_prequery(factor_wide, spec.name, signal_dates)
-            prequery = filter_long_by_pit_universe(prequery, _PIT_UNIVERSE)
-            if prequery.empty:
-                out["error"] = "empty prequery"
-                return out
-
-            prequery = _preprocess_if_needed(
-                prequery, spec, signal_dates, universe, fetch_start, end, prepared
-            )
-            if prequery.empty:
-                out["error"] = "empty after preprocessing"
-                return out
-
-            n_quantiles_key = task["n_quantiles_param"]
-            if n_quantiles_key not in params:
-                raise KeyError(f"mining params missing required key: {n_quantiles_key}")
-            n_quantiles = int(params[n_quantiles_key])
-            labeled = single_characteristic(prequery, spec.name, {spec.name: n_quantiles})
-            long_groups, short_groups = _resolve_groups(spec, n_quantiles)
-            weights = get_single_factor_weight(labeled, {
-                "factor_key": spec.name,
-                "mode": weight_mode,
-                "long": long_groups,
-                "short": short_groups,
-            })
-
-        if task.get("weight_hook"):
-            cached_price = _cache_frame(
-                prepared.get("price", _CACHE_DATA["price"]),
-                fetch_start,
-                pd.Timestamp(end) + pd.Timedelta(days=40),
-            )
-            hook_task = dict(task)
-            hook_task["context"] = {
-                "factor_wide": factor_wide,
-                "input_wides": wides,
-                "price_wide": cached_price,
-                "signal_dates": signal_dates,
-                "fetch_start": fetch_start,
-                "win_start": start,
-                "win_end": end,
-                "spec": spec,
-                "universe": universe,
-            }
-            weights = _call_module_function(
-                task["factor_module"],
-                task["weight_hook"],
-                weights,
-                hook_task,
-            )
-        weights = _weights_on_rebalance_days(weights, signal_rebalance_pairs)
-        if weights.empty:
-            out["error"] = "empty weights"
-            return out
-
-        active_codes = [
-            column for column in weights.columns
-            if column != "cash" and weights[column].fillna(0.0).abs().sum() > 0
-        ]
-        weights = weights.loc[:, active_codes + (["cash"] if "cash" in weights.columns else [])]
-
-        price_wide = _cache_frame(
-            prepared.get("price", _CACHE_DATA["price"]),
-            fetch_start,
-            pd.Timestamp(end) + pd.Timedelta(days=40),
-        )
-        execution_wide = _cache_frame(
-            prepared.get("execution_price", _CACHE_DATA.get("execution_price", _CACHE_DATA["price"])),
-            fetch_start,
-            pd.Timestamp(end) + pd.Timedelta(days=40),
-        )
-        if task["engine"] == "vector":
-            nav = _vector_backtest(weights, price_wide)
-            turnover_weights = weights
-        else:
-            stock_codes = [column for column in weights.columns if column != "cash"]
-            execution_price = _cache_frame(
-                prepared.get("execution_price", _CACHE_DATA["execution_price"]),
-                weights.index.min(),
-                weights.index.max() + pd.Timedelta(hours=task["time_tolerance"]),
-                stock_codes,
-            )
-            trade_status = _cache_frame(
-                prepared.get("trade_status", _CACHE_DATA["trade_status"]),
-                weights.index.min().normalize(),
-                weights.index.max().normalize() + pd.Timedelta(days=1),
-                stock_codes,
-            )
-            close_price = _cache_frame(
-                prepared.get("price", _CACHE_DATA["price"]),
-                weights.index.min().normalize(),
-                weights.index.max().normalize(),
-                stock_codes,
-            )
-            bt = BacktestBase(
-                weights,
-                metric=getattr(spec, "backtest_metric", "收盘价(元)"),
-                symbol=spec.name,
-                amount=task["initial_amount"],
-                time_tolerance=task["time_tolerance"],
-                table_name=getattr(spec, "table_name", "daily_market"),
-                verbose=False,
-                preloaded_cost_price=execution_price,
-                preloaded_close_price=close_price,
-                preloaded_trade_status=trade_status,
-            )
-            nav = bt.nav
-            turnover_weights = getattr(bt, "actual_weight", weights)
-        out.update(metrics_from_nav(nav))
-        out.update(robust_rank_ic_metrics(factor_wide, execution_wide, signal_rebalance_pairs))
-        out["turnover"] = mean_one_way_turnover(turnover_weights)
-        out["worker_pid"] = os.getpid()
-        out["wide_rows"] = int(len(factor_wide))
-        out["wide_columns"] = int(factor_wide.shape[1])
-        out["weight_rows"] = int(len(turnover_weights))
-        out["weight_columns"] = int(turnover_weights.shape[1])
-        out["data_sources"] = getattr(bt, "data_sources", {}) if task["engine"] != "vector" else {"price": "memmap"}
-    except Exception as exc:
-        out["error"] = f"{type(exc).__name__}: {exc}"
-        traceback.print_exc()
-    return out
-
-
-def _run_one_task(task: dict[str, Any]) -> dict[str, Any]:
-    log_path = task.get("task_log_path")
-    if not log_path:
-        return _run_one_task_impl(task)
-    path = Path(str(log_path))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8", buffering=1) as stream:
-        with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
-            started = time.perf_counter()
-            print(
-                f"worker_pid={os.getpid()} phase={task.get('phase')} "
-                f"window={task.get('win_start')}~{task.get('win_end')} "
-                f"engine={task.get('engine')} params={json.dumps(task.get('params', {}), ensure_ascii=False, sort_keys=True)}",
-                flush=True,
-            )
-            result = _run_one_task_impl(task)
-            result["task_log_path"] = str(path.resolve())
-            result["elapsed_seconds"] = round(time.perf_counter() - started, 6)
-            print(f"result={json.dumps(result, ensure_ascii=False, sort_keys=True, default=str)}", flush=True)
-            return result
-
-
-def _prepare_task_batch(tasks: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    if _CACHE_DATA is None:
-        raise RuntimeError("mining cache is not initialized")
-    if not tasks:
-        return {}
-    first = tasks[0]
-    identity = (
-        first.get("window_id"), first.get("phase"), first.get("stage_index"),
-        first.get("win_start"), first.get("win_end"), first.get("engine"),
-    )
-    for task in tasks[1:]:
-        current = (
-            task.get("window_id"), task.get("phase"), task.get("stage_index"),
-            task.get("win_start"), task.get("win_end"), task.get("engine"),
-        )
-        if current != identity:
-            raise ValueError("a mining batch must contain one window, phase, stage, and engine")
-
-    fetch_start = min(
-        pd.Timestamp(task["win_start"]) - pd.Timedelta(days=int(task["warmup_days"]))
-        for task in tasks
-    )
-    compute_end = pd.Timestamp(first["win_end"]) + pd.Timedelta(days=1)
-    price_end = pd.Timestamp(first["win_end"]) + pd.Timedelta(days=40)
-    input_names: set[str] = set()
-    industry_schemes: set[str] = set()
-    for task in tasks:
-        spec = _load_spec(task["factor_module"], task["spec_factory"], task["params"])
-        input_names.update(getattr(spec, "inputs", {}))
-        input_names.update(getattr(spec, "industry_inputs", {}))
-        if bool(getattr(spec, "use_industry", False)):
-            industry_schemes.add(getattr(spec, "industry_scheme", "申万一级行业"))
-    inputs = {
-        name: _cache_frame(_CACHE_DATA["inputs"][name], fetch_start, compute_end)
-        for name in sorted(input_names)
-    }
-    cached_industries = (_CACHE_DATA or {}).get("industry_by_scheme", {})
-    industry_by_scheme = {
-        scheme: _cache_frame(cached_industries[scheme], fetch_start, compute_end)
-        for scheme in sorted(industry_schemes)
-        if scheme in cached_industries
-    }
-    return {
-        "inputs": inputs,
-        "industry_by_scheme": industry_by_scheme,
-        "price": _cache_frame(_CACHE_DATA["price"], fetch_start, price_end),
-        "execution_price": _cache_frame(
-            _CACHE_DATA.get("execution_price", _CACHE_DATA["price"]), fetch_start, price_end
-        ),
-        "trade_status": _CACHE_DATA.get("trade_status"),
-    }
-
-
-def _run_task_batch(tasks: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Evaluate a homogeneous Grid micro-batch in one worker process."""
-    if not tasks:
-        return []
-    batch_started = time.perf_counter()
-    try:
-        prepared = _prepare_task_batch(tasks)
-    except Exception as exc:
-        results = []
-        for task in tasks:
-            result = {
-                **task,
-                "error": f"{type(exc).__name__}: {exc}",
-                "worker_pid": os.getpid(),
-            }
-            log_path = task.get("task_log_path")
-            if log_path:
-                path = Path(str(log_path))
-                path.parent.mkdir(parents=True, exist_ok=True)
-                with path.open("a", encoding="utf-8", buffering=1) as stream:
-                    stream.write(
-                        f"worker_pid={os.getpid()} batch_id={task.get('batch_id')} "
-                        f"stage={task.get('stage_index')} "
-                        f"params={json.dumps(task.get('params', {}), ensure_ascii=False, sort_keys=True)}\n"
-                    )
-                    traceback.print_exception(type(exc), exc, exc.__traceback__, file=stream)
-                    stream.write(f"result={json.dumps(result, ensure_ascii=False, default=str)}\n")
-                result["task_log_path"] = str(path.resolve())
-            results.append(result)
-        return results
-    results = []
-    for task in tasks:
-        log_path = task.get("task_log_path")
-        started = time.perf_counter()
-        try:
-            if log_path:
-                path = Path(str(log_path))
-                path.parent.mkdir(parents=True, exist_ok=True)
-                with path.open("a", encoding="utf-8", buffering=1) as stream:
-                    with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
-                        print(
-                            f"worker_pid={os.getpid()} phase={task.get('phase')} "
-                            f"window={task.get('win_start')}~{task.get('win_end')} "
-                            f"stage={task.get('stage_index')} engine={task.get('engine')} "
-                            f"batch_id={task.get('batch_id')} "
-                            f"params={json.dumps(task.get('params', {}), ensure_ascii=False, sort_keys=True)}",
-                            flush=True,
-                        )
-                        result = _run_one_task_impl(task, prepared)
-                        print(
-                            f"result={json.dumps(result, ensure_ascii=False, sort_keys=True, default=str)}",
-                            flush=True,
-                        )
-                result["task_log_path"] = str(path.resolve())
-            else:
-                result = _run_one_task_impl(task, prepared)
-        except Exception as exc:
-            result = {**task, "error": f"{type(exc).__name__}: {exc}"}
-        result["elapsed_seconds"] = round(time.perf_counter() - started, 6)
-        result["worker_pid"] = os.getpid()
-        results.append(result)
-    batch_elapsed = round(time.perf_counter() - batch_started, 6)
-    for result in results:
-        result["batch_elapsed_seconds"] = batch_elapsed
-        result["batch_size"] = len(tasks)
-    return results
-
-
-def _run_candidate_windows(task: dict[str, Any]) -> list[dict[str, Any]]:
-    """Compute one candidate once, then score all requested rolling windows."""
-    from betalens.factor.factor import get_single_factor_weight, single_characteristic
-
-    if _CACHE_DATA is None:
-        raise RuntimeError("mining cache is not initialized")
-    if str(task.get("engine", "vector")) != "vector":
-        raise ValueError("candidate-major scoring currently requires engine='vector'")
-    params = dict(task["params"])
-    windows = [dict(window) for window in task.get("windows", ())]
-    if not windows:
-        return []
-    try:
-        spec = _load_spec(task["factor_module"], task["spec_factory"], params)
-        if getattr(spec, "weight_mode", "freeplay") in ("event", "timing") or task.get("weight_hook"):
-            raise ValueError("candidate-major scoring does not support custom weight hooks")
-        span_start = min(pd.Timestamp(window["win_start"]) for window in windows)
-        span_end = max(pd.Timestamp(window["win_end"]) for window in windows)
-        fetch_start = (
-            span_start - pd.Timedelta(days=int(task["warmup_days"]))
-        ).strftime("%Y-%m-%d")
-        trade_status = _CACHE_DATA.get("trade_status")
-        trade_days = (
-            pd.DatetimeIndex(np.asarray(trade_status["dates"], dtype=np.int64))
-            if isinstance(trade_status, Mapping) and "dates" in trade_status else None
-        )
-        window_pairs = [
-            _task_signal_rebalance_pairs(
-                window["win_start"], window["win_end"], fetch_start,
-                task["rebal_freq"], trade_days,
-            )
-            for window in windows
-        ]
-        signal_dates = sorted({signal for pairs in window_pairs for signal, _rebalance in pairs})
-        if not signal_dates:
-            raise ValueError("no signal dates")
-        input_names = list(dict.fromkeys([
-            *getattr(spec, "inputs", {}), *getattr(spec, "industry_inputs", {}),
-        ]))
-        wides = {
-            name: _cache_frame(
-                _CACHE_DATA["inputs"][name], fetch_start, span_end + pd.Timedelta(days=1)
-            )
-            for name in input_names
-        }
-        factor_wide = spec.compute(**wides, **getattr(spec, "compute_kwargs", {}))
-        prequery = filter_long_by_pit_universe(
-            wide_to_prequery(factor_wide, spec.name, signal_dates), _PIT_UNIVERSE
-        )
-        prequery = _preprocess_if_needed(
-            prequery, spec, signal_dates, _CACHE_DATA.get("universe") or [],
-            fetch_start, span_end.strftime("%Y-%m-%d"),
-        )
-        if prequery.empty:
-            raise ValueError("empty prequery")
-        quantiles = int(params[task["n_quantiles_param"]])
-        labeled = single_characteristic(prequery, spec.name, {spec.name: quantiles})
-        long_groups, short_groups = _resolve_groups(spec, quantiles)
-        signal_weights = get_single_factor_weight(labeled, {
-            "factor_key": spec.name,
-            "mode": getattr(spec, "weight_mode", "freeplay"),
-            "long": long_groups,
-            "short": short_groups,
-        })
-        price = _cache_frame(
-            _CACHE_DATA["price"], fetch_start, span_end + pd.Timedelta(days=40)
-        )
-        execution = _cache_frame(
-            _CACHE_DATA.get("execution_price", _CACHE_DATA["price"]),
-            fetch_start, span_end + pd.Timedelta(days=40),
-        )
-        rows = []
-        started = time.perf_counter()
-        for window, pairs in zip(windows, window_pairs, strict=True):
-            row = {**params, **window, "gid": task["gid"], "worker_pid": os.getpid()}
-            weights = _weights_on_rebalance_days(signal_weights, pairs)
-            if weights.empty:
-                row["error"] = "empty weights"
-            else:
-                codes = [
-                    column for column in weights.columns
-                    if column != "cash" and weights[column].fillna(0.0).abs().sum() > 0
-                ]
-                weights = weights.loc[:, codes + (["cash"] if "cash" in weights.columns else [])]
-                row.update(metrics_from_nav(_vector_backtest(weights, price)))
-                row.update(robust_rank_ic_metrics(factor_wide, execution, pairs))
-                row["turnover"] = mean_one_way_turnover(weights)
-                row["wide_rows"], row["wide_columns"] = factor_wide.shape
-                row["weight_rows"], row["weight_columns"] = weights.shape
-                row["error"] = None
-            rows.append(row)
-        elapsed = round(time.perf_counter() - started, 6)
-        for row in rows:
-            row["candidate_window_seconds"] = elapsed
-            row["candidate_window_count"] = len(windows)
-        return rows
-    except Exception as exc:
-        traceback.print_exc()
-        error = f"{type(exc).__name__}: {exc}"
-        return [
-            {**params, **window, "gid": task.get("gid", ""), "worker_pid": os.getpid(), "error": error}
-            for window in windows
-        ]
-
-
-def _cache_paths(cache_dir: str | Path) -> CachePaths:
-    cache = _as_path(cache_dir)
-    ready = cache / "READY.json"
-    manifest = cache / "manifest.json"
-    if ready.exists():
-        try:
-            pointer = json.loads(ready.read_text(encoding="utf-8"))
-            manifest = cache / str(pointer["manifest"])
-        except Exception:
-            pass
-    return CachePaths(
-        data=manifest,
-        pit=manifest,
-        meta=ready,
-    )
-
-
-def _cache_dir(config: Any) -> Path:
-    if config.cache_dir is not None:
-        return _as_path(config.cache_dir)
-    return _as_path(config.output_dir) / "_cache"
-
-
-def build_cache_for_config(config: Any, spans: Sequence[tuple[str, str]], sample_params: Mapping[str, Any]) -> CachePaths:
-    """Build a cache containing PIT-safe market and industry inputs.
-
-    Industry inputs are kept in the same ``inputs`` mapping as market panels so
-    existing task workers can pass them directly to ``spec.compute``.  The
-    neutralization panel is stored separately by scheme and reused by every
-    candidate instead of querying the industry table once per task.
-    """
-    from betalens.datafeed import get_absolute_trade_days
-
-    cache_dir = _cache_dir(config)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    spec = _load_spec(config.factor_module, config.spec_factory, sample_params)
-    start = _date_min(*spans)
-    end = _date_max(*spans)
-    fetch_start = (
-        pd.Timestamp(start) - pd.Timedelta(days=int(config.max_warmup_days))
-    ).strftime("%Y-%m-%d")
-    signature = _cache_signature(config, spec, fetch_start, end)
-    ready_path = cache_dir / "READY.json"
-    if ready_path.exists() and not config.rebuild_cache:
-        try:
-            pointer = json.loads(ready_path.read_text(encoding="utf-8"))
-            pointed_manifest = cache_dir / str(pointer["manifest"])
-            pointed = json.loads(pointed_manifest.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError, KeyError):
-            pointed_manifest = None
-            pointed = {}
-        if pointed_manifest is not None and pointed.get("cache_signature") == signature:
-            print(f"[cache] hit: {pointed_manifest}")
-            return CachePaths(data=pointed_manifest, pit=pointed_manifest, meta=ready_path)
-    existing_manifest = cache_dir / signature / "manifest.json"
-    if existing_manifest.exists() and not config.rebuild_cache:
-        try:
-            meta = json.loads(existing_manifest.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError):
-            meta = {}
-        if meta.get("schema_version") == CACHE_SCHEMA_VERSION and meta.get("cache_signature") == signature:
-            print(f"[cache] hit: {existing_manifest}")
-            return CachePaths(data=existing_manifest, pit=existing_manifest, meta=cache_dir / "READY.json")
-
-    print(f"[cache] fetch range: {fetch_start} ~ {end}")
-    all_days = sorted(get_absolute_trade_days(fetch_start, end, "D"))
-    pit_days = all_days if getattr(spec, "mask_inputs_by_pit", False) else [
-        d for d in all_days if d >= pd.Timestamp(start).date()
-    ]
-
-    pit = None
-    universe = list(config.universe) if config.universe is not None else None
-    index_code = getattr(spec, "index_code", None)
-    if index_code:
-        t0 = time.time()
-        pit = build_pit_universe(pit_days, index_code)
-        universe = sorted({code for codes in pit.values() for code in codes})
-        print(f"[cache] PIT universe: {len(universe)} codes, {len(pit)} dates, {time.time() - t0:.1f}s")
-    elif universe is None:
-        raise ValueError("config.universe is required when spec.index_code is empty")
-
-    raw_inputs = {}
-    inputs = {}
-    metrics_by_arg = dict(getattr(spec, "inputs", {}) or {})
-    for arg_name, metric in metrics_by_arg.items():
-        t0 = time.time()
-        wide = fetch_daily_wide(
-            metric,
-            universe=universe,
-            start_date=fetch_start,
-            end_date=end,
-            table_name=getattr(spec, "table_name", "daily_market"),
-        )
-        raw_inputs[arg_name] = wide
-        print(f"[cache] {arg_name} ({metric}): {wide.shape}, {time.time() - t0:.1f}s")
-
-    execution_metric = getattr(spec, "backtest_metric", "收盘价(元)")
-    input_price = next(
-        (wide for arg, metric in metrics_by_arg.items() if metric == execution_metric for wide in [raw_inputs[arg]]),
-        None,
-    )
-    if input_price is None:
-        t0 = time.time()
-        execution_price = fetch_daily_wide(
-            execution_metric,
-            universe=universe,
-            start_date=fetch_start,
-            end_date=end,
-            table_name=getattr(spec, "table_name", "daily_market"),
-        )
-        print(f"[cache] execution price ({execution_metric}): {execution_price.shape}, {time.time() - t0:.1f}s")
-    else:
-        execution_price = input_price.copy()
-
-    close_metric = "收盘价(元)"
-    input_close = next(
-        (wide for arg, metric in metrics_by_arg.items() if metric == close_metric for wide in [raw_inputs[arg]]),
-        None,
-    )
-    if input_close is None:
-        t0 = time.time()
-        close_price = fetch_daily_wide(
-            close_metric,
-            universe=universe,
-            start_date=fetch_start,
-            end_date=end,
-            table_name=getattr(spec, "table_name", "daily_market"),
-        )
-        print(f"[cache] valuation price ({close_metric}): {close_price.shape}, {time.time() - t0:.1f}s")
-    else:
-        close_price = input_close.copy()
-
-    # Market metrics can have different intraday timestamps.  Align them
-    # before deriving the reference index, PIT masks, or the cached price
-    # panel so every formula receives identically labelled daily wides.
-    aligned_market = align_daily_wides(raw_inputs)
-    raw_inputs = {arg_name: aligned_market[arg_name] for arg_name in metrics_by_arg}
-    price = close_price
-    for arg_name, wide in raw_inputs.items():
-        inputs[arg_name] = (
-            mask_wide_by_pit_universe(wide, pit)
-            if getattr(spec, "mask_inputs_by_pit", False)
-            else wide
-        )
-
-    reference_index = next(
-        (wide.index for wide in raw_inputs.values() if wide is not None and not wide.empty),
-        pd.DatetimeIndex(all_days),
-    )
-    industry_by_scheme = {}
-    industry_specs = dict(getattr(spec, "industry_inputs", {}) or {})
-    schemes = dict(industry_specs)
-    neutralize_scheme = getattr(spec, "industry_scheme", None) if getattr(spec, "use_industry", False) else None
-    if neutralize_scheme:
-        schemes.setdefault("__neutralize_industry", neutralize_scheme)
-    for arg_name, scheme in schemes.items():
-        t0 = time.time()
-        wide = fetch_industry_wide(scheme, universe, all_days, reference_index=reference_index)
-        if arg_name == "__neutralize_industry":
-            industry_by_scheme[scheme] = mask_wide_by_pit_universe(wide, pit) if getattr(spec, "mask_inputs_by_pit", False) else wide
-        else:
-            inputs[arg_name] = mask_wide_by_pit_universe(wide, pit) if getattr(spec, "mask_inputs_by_pit", False) else wide
-        print(f"[cache] {arg_name} ({scheme}): {wide.shape}, {time.time() - t0:.1f}s")
-
-    t0 = time.time()
-    trade_status = fetch_trade_status_wide(universe or [], all_days)
-    print(f"[cache] trade_status: {trade_status.shape}, {time.time() - t0:.1f}s")
-    from betalens.factor.mining_cache import publish
-
-    manifest = publish(
-        cache_dir,
-        signature,
-        inputs=inputs,
-        price=price,
-        execution_price=execution_price,
-        trade_status=trade_status,
-        industry_by_scheme=industry_by_scheme,
-        pit=pit,
-        universe=list(universe or []),
-        metadata={
-        "input_shapes": {name: list(wide.shape) for name, wide in inputs.items()},
-        "price_shape": list(price.shape) if isinstance(price, pd.DataFrame) else None,
-        "execution_price_shape": list(execution_price.shape),
-        "industry_schemes": sorted(industry_by_scheme),
-        "universe_size": len(universe or []),
-        },
-        rebuild=bool(config.rebuild_cache),
-    )
-    print(f"[cache] saved: {cache_dir}")
-    return CachePaths(data=manifest, pit=manifest, meta=cache_dir / "READY.json")
-
-
-def build_tasks(
-    *,
-    config: Any,
-    phase: str,
-    span: tuple[str, str],
-    schemes: Sequence[tuple[int, int]],
-    combos: Sequence[Mapping[str, Any]],
-    cap: int | None = None,
-) -> list[dict[str, Any]]:
-    tasks = []
-    for win_len, step in schemes:
-        scheme = f"{win_len}/{step}"
-        windows = gen_rolling_windows(span[0], span[1], win_len, step, cap=cap)
-        for win_start, win_end in windows:
-            for combo in combos:
-                params = dict(combo["params"])
-                tasks.append({
-                    "params": params,
-                    "gid": combo["gid"],
-                    "factor_module": config.factor_module,
-                    "spec_factory": config.spec_factory,
-                    "weight_hook": config.weight_hook,
-                    "warmup_days": _warmup_days(config, params),
-                    "phase": phase,
-                    "scheme": scheme,
-                    "win_start": win_start,
-                    "win_end": win_end,
-                    "engine": config.engine,
-                    "rebal_freq": config.rebal_freq,
-                    "n_quantiles_param": config.n_quantiles_param,
-                    "initial_amount": config.initial_amount,
-                    "time_tolerance": config.time_tolerance,
-                })
-    return tasks
-
-
-def build_paired_tasks(
-    *,
-    config: Any,
-    phase: str,
-    pairs: Sequence[tuple[str, str, str, str]],
-    scheme: str,
-    combos: Sequence[Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    """Build tasks for a paired rolling train/test schedule."""
-    tasks = []
-    for train_start, train_end, test_start, test_end in pairs:
-        if phase == "train":
-            win_start, win_end = train_start, train_end
-        elif phase == "test":
-            win_start, win_end = test_start, test_end
-        else:
-            raise ValueError(f"paired tasks only support train/test, got {phase!r}")
-        for combo in combos:
-            params = dict(combo["params"])
-            tasks.append({
-                "params": params,
-                "gid": combo["gid"],
-                "factor_module": config.factor_module,
-                "spec_factory": config.spec_factory,
-                "weight_hook": config.weight_hook,
-                "warmup_days": _warmup_days(config, params),
-                "phase": phase,
-                "scheme": scheme,
-                "win_start": win_start,
-                "win_end": win_end,
-                "engine": config.engine,
-                "rebal_freq": config.rebal_freq,
-                "n_quantiles_param": config.n_quantiles_param,
-                "initial_amount": config.initial_amount,
-                "time_tolerance": config.time_tolerance,
-            })
-    return tasks
-
-
-def build_sweep_tasks(config: ParameterSweepConfig, combos: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    tasks = []
-    for combo in combos:
-        params = dict(combo["params"])
-        tasks.append({
-            "params": params,
-            "gid": combo["gid"],
-            "factor_module": config.factor_module,
-            "spec_factory": config.spec_factory,
-            "weight_hook": config.weight_hook,
-            "warmup_days": _warmup_days(config, params),
-            "phase": "sweep",
-            "scheme": "full",
-            "win_start": config.span[0],
-            "win_end": config.span[1],
-            "engine": config.engine,
-            "rebal_freq": config.rebal_freq,
-            "n_quantiles_param": config.n_quantiles_param,
-            "initial_amount": config.initial_amount,
-            "time_tolerance": config.time_tolerance,
-        })
-    return tasks
-
-
-def run_tasks(
-    config: Any,
-    tasks: Sequence[dict[str, Any]],
-    cache_paths: CachePaths,
-    *,
-    executor: ProcessPoolExecutor | None = None,
-) -> pd.DataFrame:
     rows = []
-    total = len(tasks)
-    if total == 0:
-        return pd.DataFrame()
-
-    effective_workers = _effective_workers_for_memory(config, cache_paths)
-    t0 = time.time()
-    _render_progress_bar(0, total, t0, submitted=0, active=0)
-    if effective_workers <= 1:
-        if executor is None:
-            _init_worker(str(cache_paths.data), str(cache_paths.pit))
-        for i, task in enumerate(tasks, 1):
-            _log_task_start(task, i, total)
-            _render_progress_bar(i - 1, total, t0, submitted=i, active=1)
-            if executor is None:
-                rows.append(_run_one_task(task))
+    windows_started = time.perf_counter()
+    for position, window in enumerate(windows, 1):
+        window_started = time.perf_counter()
+        report_progress = _TASK_LOGS and _progress_due(position, len(windows), updates=20)
+        if report_progress:
+            _LOGGER.info(
+                "%s候选 %s：开始评价第%d/%d个窗口（%.1f%%），窗口方案=%s，评分区间=%s 至 %s",
+                _stage_name(stage),
+                candidate,
+                position,
+                len(windows),
+                (position - 1) / len(windows) * 100,
+                _window_description(window.window_id),
+                window.start,
+                window.end,
+            )
+        try:
+            active_spec = spec
+            factor, weights = full_factor, full_weights
+            if mode == "rolling_fit":
+                active_spec = _import_spec(module, params)
+                if active_spec.execution_mode != "rolling_fit" or active_spec.fit_window is None:
+                    raise ValueError("rolling_fit requires MiningSpec.fit_window")
+                fit_start = pd.Timestamp(window.start) - pd.Timedelta(days=_warmup_days(active_spec, params))
+                window_data = _slice_data(data, fit_start, window.end)
+                with _heartbeat("candidate.fit_window", stage=stage, candidate=candidate, window=window.window_id):
+                    result = _call_fit(active_spec.fit_window, window_data, params, window, {"spec": active_spec, "evaluation": evaluation})
+                if isinstance(result, Mapping):
+                    factor, weights = result.get("factor_wide"), result.get("weights")
+                elif isinstance(result, pd.DataFrame):
+                    weights = result
+                else:
+                    raise TypeError("fit_window must return DataFrame or mapping")
+                if weights is None and factor is not None:
+                    weights = _build_weights(factor, active_spec, params, window_data, window.start, window.end, frequency)
+                with _heartbeat("candidate.window_nav", stage=stage, candidate=candidate, window=window.window_id):
+                    nav = _vector_nav(weights, window_data.price) if engine == "vector" else _exact_nav(weights, window_data, active_spec, amount, tolerance)
+            elif spec.window_transform is not None:
+                transformed = spec.window_transform(weights, window, {"data": data, "spec": spec, "params": params})
+                weights = transformed if transformed is not None else weights
+                with _heartbeat("candidate.window_nav", stage=stage, candidate=candidate, window=window.window_id):
+                    nav = _vector_nav(weights, data.price) if engine == "vector" else _exact_nav(weights, data, spec, amount, tolerance)
             else:
-                rows.append(executor.submit(_run_one_task, task).result())
-            _render_progress_bar(i, total, t0, submitted=i, active=0, final=i == total)
-        return pd.DataFrame(rows)
-
-    done = 0
-    submitted = 0
-    owns_executor = executor is None
-    if executor is None:
-        executor = ProcessPoolExecutor(
-            max_workers=effective_workers,
-            initializer=_init_worker,
-            initargs=(str(cache_paths.data), str(cache_paths.pit)),
+                nav = full_nav
+            if nav is None or len(nav) == 0:
+                raise ValueError("empty nav")
+            if mode == "rolling_fit" or spec.window_transform is not None:
+                _persist_nav(nav, candidate, window.window_id, evaluation)
+            index = pd.DatetimeIndex(nav.index)
+            keep = (index.normalize() >= pd.Timestamp(window.start)) & (index.normalize() <= pd.Timestamp(window.end))
+            metrics = metrics_from_nav(pd.Series(nav.to_numpy()[keep], index=index[keep]))
+            window_weights = _slice_frame(weights, window.start, window.end)
+            metrics["turnover"] = _turnover(window_weights)
+            if factor is not None:
+                metrics.update(_rank_ic(factor, data.execution_price, _signal_pairs(window.start, window.end, frequency, data.execution_price.index)))
+            row = {"factor_id": factor_id, "candidate_id": candidate, "stage": stage, "window_id": window.window_id, "window_start": window.start, "window_end": window.end, "params_json": json.dumps(params, ensure_ascii=False, sort_keys=True, default=str), **params, **metrics, "error": None}
+            if report_progress:
+                window_elapsed = time.perf_counter() - windows_started
+                eta = window_elapsed / position * (len(windows) - position)
+                _LOGGER.info(
+                    "%s候选 %s：完成第%d/%d个窗口（%.1f%%），窗口方案=%s，夏普=%.4f，最大回撤=%.2f%%，本窗口耗时=%s，预计剩余=%s",
+                    _stage_name(stage),
+                    candidate,
+                    position,
+                    len(windows),
+                    position / len(windows) * 100,
+                    _window_description(window.window_id),
+                    float(metrics.get("sharpe", np.nan)),
+                    float(metrics.get("mdd", np.nan)) * 100,
+                    _elapsed(window_started),
+                    _human_duration(eta),
+                )
+        except Exception as exc:
+            row = {"factor_id": factor_id, "candidate_id": candidate, "stage": stage, "window_id": window.window_id, "window_start": window.start, "window_end": window.end, "params_json": json.dumps(params, ensure_ascii=False, sort_keys=True, default=str), **params, "error": f"{type(exc).__name__}: {exc}"}
+            _LOGGER.exception(
+                "%s候选 %s：第%d/%d个窗口计算失败，窗口方案=%s，错误=%s",
+                _stage_name(stage),
+                candidate,
+                position,
+                len(windows),
+                _window_description(window.window_id),
+                row["error"],
+            )
+        rows.append(row)
+    failed = sum(row.get("error") is not None for row in rows)
+    if _TASK_LOGS:
+        _LOGGER.info(
+            "%s候选计算完成：因子=%s，候选=%s，窗口总数=%d，成功=%d，失败=%d，总耗时=%s",
+            _stage_name(stage),
+            factor_id,
+            candidate,
+            len(rows),
+            len(rows) - failed,
+            failed,
+            _elapsed(candidate_started),
         )
+    return rows
+
+
+def _safe_evaluate(module: str, factor_id: str, params: Mapping[str, Any], stage: str, windows: Sequence[MiningWindow], data: MiningData, evaluation: Mapping[str, Any]) -> list[dict[str, Any]]:
     try:
-        futures = set()
-        future_meta = {}
+        return _evaluate_candidate(module, factor_id, params, stage, windows, data, evaluation)
+    except Exception as exc:
+        _LOGGER.exception(
+            "%s候选发生致命错误：因子=%s，候选=%s，错误类型=%s，错误信息=%s",
+            _stage_name(stage),
+            factor_id,
+            _candidate_id(factor_id, params),
+            type(exc).__name__,
+            exc,
+        )
+        return [{"factor_id": factor_id, "candidate_id": _candidate_id(factor_id, params), "stage": stage, "window_id": window.window_id, "window_start": window.start, "window_end": window.end, "params_json": json.dumps(dict(params), ensure_ascii=False, sort_keys=True, default=str), **dict(params), "error": f"{type(exc).__name__}: {exc}"} for window in windows]
 
-        def _submit_until_full():
-            nonlocal submitted
-            while submitted < total and len(futures) < effective_workers:
-                task = tasks[submitted]
-                submitted += 1
-                _log_task_start(task, submitted, total)
-                future = executor.submit(_run_one_task, task)
-                futures.add(future)
-                future_meta[future] = submitted
-                _render_progress_bar(
-                    done,
-                    total,
-                    t0,
-                    submitted=submitted,
-                    active=len(futures),
-                )
 
-        _submit_until_full()
-        while futures:
-            finished, futures = wait(futures, return_when=FIRST_COMPLETED)
-            for future in finished:
-                future_meta.pop(future, None)
-                rows.append(future.result())
-                done += 1
-                _render_progress_bar(
-                    done,
-                    total,
-                    t0,
-                    submitted=submitted,
-                    active=len(futures),
-                    final=done == total,
-                )
-            _submit_until_full()
-    except BaseException:
-        for future in futures:
-            future.cancel()
+_WORKER_DATA: MiningData | None = None
+
+
+def _initialize_worker(
+    data: MiningData | None,
+    cache_manifest_path: str | None,
+    log_queue,
+    log_level: int,
+    task_logs: bool,
+    heartbeat_seconds: float,
+) -> None:
+    global _WORKER_DATA
+    _configure_worker_logging(log_queue, log_level, task_logs, heartbeat_seconds)
+    _LOGGER.info("工作进程开始初始化：PID=%d，使用共享缓存=%s", os.getpid(), _yes_no(cache_manifest_path))
+    _WORKER_DATA = _load_cached_data(cache_manifest_path) if cache_manifest_path else data
+    _LOGGER.info("工作进程初始化完成：PID=%d", os.getpid())
+
+
+def _worker_evaluate(module: str, factor_id: str, params: Mapping[str, Any], stage: str, windows: Sequence[MiningWindow], evaluation: Mapping[str, Any]) -> list[dict[str, Any]]:
+    if _WORKER_DATA is None:
+        raise RuntimeError("mining worker data was not initialized")
+    return _safe_evaluate(module, factor_id, params, stage, windows, _WORKER_DATA, evaluation)
+
+
+def _summary(frame: pd.DataFrame, selection: Mapping[str, Any]) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame()
+    total = frame.groupby(["factor_id", "candidate_id"]).size().rename("window_count")
+    valid = frame[frame["error"].isna()]
+    if valid.empty:
+        return pd.DataFrame()
+    summary = valid.groupby(["factor_id", "candidate_id"]).agg(
+        valid_window_count=("window_id", "size"),
+        sharpe_mean=("sharpe", "mean"),
+        sharpe_median=("sharpe", "median"),
+        sharpe_p25=("sharpe", lambda value: value.quantile(0.25)),
+        max_mdd=("mdd", "max"),
+        turnover_mean=("turnover", "mean"),
+        rank_ic_median=("rank_ic", "median"),
+    ).reset_index().merge(total.reset_index(), on=["factor_id", "candidate_id"])
+    identity_columns = [
+        name for name in frame.columns
+        if name not in {
+            "stage", "window_id", "window_start", "window_end", "ann_ret", "ann_vol",
+            "sharpe", "mdd", "calmar", "turnover", "rank_ic", "robust_rank_ic",
+            "mean_rank_ic", "ic_coverage", "n_days", "error", "factor_id", "candidate_id",
+        }
+    ]
+    if identity_columns:
+        identity = valid.groupby(["factor_id", "candidate_id"], as_index=False)[identity_columns].first()
+        summary = summary.merge(identity, on=["factor_id", "candidate_id"], how="left")
+    summary["valid_window_ratio"] = summary.valid_window_count / summary.window_count.replace(0, np.nan)
+    objective = selection.get("objective", {}) or {}
+    metric, aggregate = str(objective.get("metric", "sharpe")), str(objective.get("aggregate", "median"))
+    source = {("sharpe", "mean"): "sharpe_mean", ("sharpe", "median"): "sharpe_median", ("sharpe", "p25"): "sharpe_p25"}.get((metric, aggregate), metric)
+    if source not in summary:
+        aggregators = {
+            "mean": "mean",
+            "median": "median",
+            "p25": lambda value: value.quantile(0.25),
+            "min": "min",
+            "max": "max",
+        }
+        if metric not in valid.columns:
+            raise ValueError(f"unknown objective metric: {metric}")
+        if aggregate not in aggregators:
+            raise ValueError(f"unsupported objective aggregate: {aggregate}")
+        source = f"{metric}_{aggregate}"
+        values = (
+            valid.groupby(["factor_id", "candidate_id"])[metric]
+            .agg(aggregators[aggregate])
+            .rename(source)
+            .reset_index()
+        )
+        summary = summary.merge(values, on=["factor_id", "candidate_id"], how="left")
+    summary["objective"] = summary[source]
+    summary["selection_status"] = "candidate"
+    operators = {">=": lambda left, right: left >= right, "<=": lambda left, right: left <= right, ">": lambda left, right: left > right, "<": lambda left, right: left < right, "==": lambda left, right: left == right}
+    for rule in selection.get("filters", []) or []:
+        name, op, target = str(rule.get("metric")), str(rule.get("op", ">=")), rule.get("value")
+        if name not in summary:
+            raise ValueError(f"unknown selection filter metric: {name}")
+        if target is None:
+            raise ValueError(f"selection filter {name} is missing value")
+        if op not in operators:
+            raise ValueError(f"unsupported selection operator: {op}")
+        summary.loc[~operators[op](summary[name], target).fillna(False), "selection_status"] = "filtered"
+    summary = summary.sort_values("objective", ascending=str(objective.get("direction", "maximize")).lower() == "minimize", na_position="last").reset_index(drop=True)
+    eligible = summary.index[summary.selection_status == "candidate"]
+    summary.loc[eligible[:int(selection.get("top_k", len(summary)))], "selection_status"] = "selected"
+    return summary
+
+
+def _write_frame(frame: pd.DataFrame, path: Path, format_name: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if str(format_name).lower() == "parquet":
+        try:
+            frame.to_parquet(path, index=False)
+            return path
+        except (ImportError, ValueError):
+            pass
+    target = path.with_suffix(".csv")
+    frame.to_csv(target, index=False, encoding="utf-8-sig")
+    return target
+
+
+def _evaluate_stage(module: str, factor_id: str, candidates: Sequence[Mapping[str, Any]], stage: str, windows: Sequence[MiningWindow], data: MiningData, evaluation: Mapping[str, Any], runtime: Mapping[str, Any]) -> pd.DataFrame:
+    stage_started = time.perf_counter()
+    total_candidates = len(candidates)
+    if not candidates:
+        _LOGGER.info("%s已跳过：因子=%s，没有待计算候选", _stage_name(stage), factor_id)
+        return pd.DataFrame()
+    requested_workers = int(runtime.get("workers", 1))
+    workers = _effective_workers(requested_workers, data, float(runtime.get("max_memory_ratio", 0.5)))
+    main_file = str(getattr(sys.modules.get("__main__"), "__file__", "") or "")
+    spawn_safe = not (sys.platform == "win32" and (not main_file or main_file.startswith("<")))
+    use_processes = (
+        str(runtime.get("backend", "process")).lower() == "process"
+        and workers > 1
+        and len(candidates) > 1
+        and spawn_safe
+    )
+    if workers > 1 and not spawn_safe:
+        warnings.warn(
+            "Windows 多进程挖掘必须从 Python 文件启动；当前是交互式会话，将改用单进程运行",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    resident = sum(
+        _frame_bytes(value)
+        for value in [
+            *data.inputs.values(),
+            data.price,
+            data.execution_price,
+            data.trade_status,
+            *data.industry_by_scheme.values(),
+        ]
+    )
+    backend = "process" if use_processes else "serial"
+    _LOGGER.info(
+        "开始%s：因子=%s，候选数=%d，每个候选窗口数=%d，运行方式=%s，实际进程数=%d，配置进程数=%d，加载数据约=%s",
+        _stage_name(stage),
+        factor_id,
+        total_candidates,
+        len(windows),
+        _backend_name(backend),
+        workers if use_processes else 1,
+        requested_workers,
+        _human_bytes(resident),
+    )
+
+    def report(completed: int, index: int, rows: list[dict[str, Any]], candidate_started: float) -> None:
+        failed = sum(row.get("error") is not None for row in rows)
+        sharpe_values = [float(row["sharpe"]) for row in rows if row.get("error") is None and pd.notna(row.get("sharpe"))]
+        elapsed_seconds = time.perf_counter() - stage_started
+        eta = elapsed_seconds / completed * (total_candidates - completed) if completed else 0.0
+        _LOGGER.info(
+            "%s进度：因子=%s，已完成%d/%d个候选（%.1f%%），刚完成候选=%s，有效窗口=%d，失败窗口=%d，夏普中位数=%s，候选耗时=%s，预计剩余=%s",
+            _stage_name(stage),
+            factor_id,
+            completed,
+            total_candidates,
+            completed / total_candidates * 100,
+            _candidate_id(factor_id, candidates[index]),
+            len(rows) - failed,
+            failed,
+            f"{float(np.median(sharpe_values)):.4f}" if sharpe_values else "暂无",
+            _elapsed(candidate_started),
+            _human_duration(eta),
+        )
+
+    if use_processes:
+        cache_manifest_path = data.cache_manifest_path
+        initializer_data = None if cache_manifest_path else data
+        context = mp.get_context("spawn" if sys.platform == "win32" else None)
+        log_queue = context.Queue()
+        listener = QueueListener(log_queue, *_LOGGER.handlers, respect_handler_level=True)
+        listener.start()
+        rows_by_index: dict[int, list[dict[str, Any]]] = {}
+        try:
+            with ProcessPoolExecutor(
+                max_workers=workers,
+                mp_context=context,
+                initializer=_initialize_worker,
+                initargs=(
+                    initializer_data,
+                    cache_manifest_path,
+                    log_queue,
+                    _LOGGER.level,
+                    _TASK_LOGS,
+                    _HEARTBEAT_SECONDS,
+                ),
+            ) as executor:
+                futures = {}
+                for index, params in enumerate(candidates):
+                    submitted = time.perf_counter()
+                    future = executor.submit(
+                        _worker_evaluate,
+                        module,
+                        factor_id,
+                        params,
+                        stage,
+                        windows,
+                        evaluation,
+                    )
+                    futures[future] = (index, submitted)
+                for completed, future in enumerate(as_completed(futures), 1):
+                    index, submitted = futures[future]
+                    rows = future.result()
+                    rows_by_index[index] = rows
+                    report(completed, index, rows, submitted)
+        finally:
+            listener.stop()
+            log_queue.close()
+            log_queue.join_thread()
+        output = pd.DataFrame(
+            [row for index in range(total_candidates) for row in rows_by_index[index]]
+        )
+    else:
+        batches = []
+        for index, params in enumerate(candidates):
+            candidate_started = time.perf_counter()
+            rows = _safe_evaluate(module, factor_id, params, stage, windows, data, evaluation)
+            batches.append(rows)
+            report(index + 1, index, rows, candidate_started)
+        output = pd.DataFrame([row for rows in batches for row in rows])
+    failures = int(output["error"].notna().sum()) if not output.empty and "error" in output else 0
+    _LOGGER.info(
+        "%s完成：因子=%s，候选数=%d，窗口结果=%d条，失败窗口=%d，总耗时=%s",
+        _stage_name(stage),
+        factor_id,
+        total_candidates,
+        len(output),
+        failures,
+        _elapsed(stage_started),
+    )
+    return output
+
+
+def _ask_candidates(study, parameter_specs: Mapping[str, Mapping[str, Any]], count: int):
+    from betalens.factor.mining_optuna import suggest_params
+
+    trials, candidates = [], []
+    for _ in range(max(0, int(count))):
+        trial = study.ask()
+        trials.append(trial)
+        candidates.append(suggest_params(trial, parameter_specs))
+    return trials, candidates
+
+
+def _tell_candidates(study, trials, candidates, factor_id: str, summary: pd.DataFrame) -> None:
+    from betalens.factor.mining_optuna import tell_trial
+
+    scores = {}
+    if not summary.empty:
+        scores = summary.set_index("candidate_id")["objective"].to_dict()
+    for trial, params in zip(trials, candidates):
+        candidate = _candidate_id(factor_id, {**dict(params), "factor_id": factor_id})
+        score = scores.get(candidate)
+        tell_trial(study, trial, None if score is None or not np.isfinite(score) else float(score))
+
+
+def _grid_specs(
+    parameter_specs: Mapping[str, Mapping[str, Any]],
+    candidates: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, list[Any]], dict[str, dict[str, Any]]]:
+    search_space = {}
+    for name in parameter_specs:
+        values, seen = [], set()
+        for candidate in candidates:
+            value = candidate[name]
+            key = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+            if key not in seen:
+                seen.add(key)
+                values.append(value)
+        search_space[name] = values
+    specs = {}
+    for name, values in search_space.items():
+        source = parameter_specs[name]
+        specs[name] = {"type": "categorical", "choices": values}
+    return search_space, specs
+
+
+def _all_alpha_configs() -> dict[str, Any]:
+    from alpha101_parameters import aggregate_mining_factors
+
+    return aggregate_mining_factors()
+
+
+def _run_mining(parameter_config_path: str | Path, performance_config_path: str | Path) -> MiningResult:
+    """Run sparse coarse search followed by an automatically refined grid."""
+    global _ACTIVE_RUN_MANIFEST, _ACTIVE_RUN_MANIFEST_PATH
+    from betalens.factor.mining_optuna import (
+        create_coarse_study,
+        create_fine_grid_study,
+        generate_fine_candidates,
+    )
+    import yaml
+
+    run_started = time.perf_counter()
+    parameter_path = Path(parameter_config_path).resolve()
+    performance_path = Path(performance_config_path).resolve()
+    factor_directory = parameter_path.parent.parent
+    if str(factor_directory) not in sys.path:
+        sys.path.insert(0, str(factor_directory))
+    parameters_config = _load_yaml(parameter_path)
+    performance = _load_yaml(performance_path)
+    log_config = performance.get("logging") or {}
+    level_name = str(log_config.get("level", "INFO")).upper()
+    levels = logging.getLevelNamesMapping()
+    if level_name not in levels:
+        raise ValueError(f"unsupported logging.level: {level_name}")
+    heartbeat_seconds = float(log_config.get("heartbeat_seconds", 30))
+    if heartbeat_seconds < 0:
+        raise ValueError("logging.heartbeat_seconds must be >= 0")
+    if int(parameters_config.get("version", 1)) != 1:
+        raise ValueError(f"unsupported mining parameter_space version: {parameters_config.get('version')}")
+    base = performance_path.parent
+    for section, key in (("output", "directory"), ("cache", "directory")):
+        value = (performance.get(section) or {}).get(key)
+        if value and not Path(str(value)).is_absolute():
+            performance[section][key] = str((base / str(value)).resolve())
+    output_config = performance.get("output") or {}
+    output_dir = Path(output_config.get("directory", "outputs/mining"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    run_id = f"{pd.Timestamp.now(tz='UTC').strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}"
+    audit_path = _configure_mining_logging(
+        output_dir,
+        run_id,
+        levels[level_name],
+        task_logs=bool(log_config.get("task_logs", True)),
+        heartbeat_seconds=heartbeat_seconds,
+    )
+    started_at = pd.Timestamp.now(tz="UTC").isoformat()
+    _ACTIVE_RUN_MANIFEST_PATH = output_dir / "run_manifest.json"
+    _ACTIVE_RUN_MANIFEST = {
+        "run_id": run_id,
+        "status": "running",
+        "started_at": started_at,
+        "parameter_config": str(parameter_path),
+        "performance_config": str(performance_path),
+        "audit_log": str(audit_path),
+    }
+    _ACTIVE_RUN_MANIFEST_PATH.write_text(
+        json.dumps(_ACTIVE_RUN_MANIFEST, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    try:
+        import optuna
+
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+    except ImportError:
+        pass
+    _LOGGER.info(
+        "开始参数挖掘：运行编号=%s，参数空间配置=%s，性能配置=%s，审计日志=%s",
+        run_id,
+        parameter_path,
+        performance_path,
+        audit_path,
+    )
+    factors = parameters_config.get("factors") or {}
+    if factors == "all":
+        if str(parameters_config.get("factor_class", "")).lower() != "alpha101":
+            raise ValueError("factors: all is currently supported only for alpha101")
+        factors = _all_alpha_configs()
+    if isinstance(factors, list):
+        factors = {str(value["id"]): value for value in factors}
+    if not isinstance(factors, Mapping) or not factors:
+        raise ValueError("factors must be a non-empty mapping or `all`")
+    _LOGGER.info(
+        "挖掘范围已确认：因子类别=%s，因子数=%d，因子=%s",
+        parameters_config.get("factor_class"),
+        len(factors),
+        ",".join(map(str, factors)),
+    )
+    evaluation = dict(parameters_config.get("evaluation") or {})
+    span = tuple(evaluation.get("span") or parameters_config.get("span") or ())
+    if len(span) != 2:
+        raise ValueError("evaluation.span must contain [start, end]")
+    if pd.Timestamp(span[0]) > pd.Timestamp(span[1]):
+        raise ValueError("evaluation.span start must not exceed end")
+    evaluation["span"] = [str(span[0]), str(span[1])]
+    window_config = parameters_config.get("windows") or {}
+    lengths, steps = _validate_window_config(window_config)
+    windows = _windows((str(span[0]), str(span[1])), lengths, steps)
+    if not windows:
+        raise ValueError("windows produced no complete windows")
+    _LOGGER.info(
+        "滑动窗口已生成：评价区间=%s 至 %s，窗口长度=%s日，滑动步长=%s日，共%d个窗口",
+        span[0],
+        span[1],
+        lengths,
+        steps,
+        len(windows),
+    )
+    runtime = performance.get("runtime") or {}
+    backend = str(runtime.get("backend", "process")).lower()
+    if backend not in {"process", "serial"}:
+        raise ValueError("runtime.backend must be process or serial")
+    if int(runtime.get("workers", 1)) < 1 or int(runtime.get("chunk_size", 1)) < 1:
+        raise ValueError("runtime.workers and runtime.chunk_size must be positive")
+    memory_ratio = float(runtime.get("max_memory_ratio", 0.5))
+    if not 0 < memory_ratio <= 1:
+        raise ValueError("runtime.max_memory_ratio must be in (0, 1]")
+    cache_config = performance.get("cache") or {}
+    if str(cache_config.get("format", "npy-memmap")).lower() != "npy-memmap":
+        raise ValueError("cache.format must be npy-memmap")
+    if str(output_config.get("window_results", "parquet")).lower() not in {"parquet", "csv"}:
+        raise ValueError("output.window_results must be parquet or csv")
+    persist_nav = str(output_config.get("persist_full_nav", "selected_only")).lower()
+    if persist_nav not in {"none", "selected_only"}:
+        raise ValueError("output.persist_full_nav must be none or selected_only")
+    nav_staging = None
+    if persist_nav == "selected_only":
+        nav_staging = output_dir / ".nav_staging" / run_id
+        nav_staging.mkdir(parents=True, exist_ok=False)
+    search = parameters_config.get("search") or {}
+    selection = parameters_config.get("selection") or {}
+    objective_config = selection.get("objective", {}) or {}
+    direction = str(objective_config.get("direction", "maximize")).lower()
+    if direction not in {"maximize", "minimize"}:
+        raise ValueError("selection.objective.direction must be maximize or minimize")
+    _LOGGER.info(
+        "运行配置：运行方式=%s，进程数=%d，启用缓存=%s，缓存目录=%s，回测引擎=%s，优化目标=%s的%s（%s），输出目录=%s，详细任务日志=%s，存活提示间隔=%s秒",
+        _backend_name(backend),
+        int(runtime.get("workers", 1)),
+        _yes_no(cache_config.get("enabled", True)),
+        cache_config.get("directory"),
+        _engine_name(evaluation.get("engine", "vector")),
+        _metric_name(objective_config.get("metric", "sharpe")),
+        _aggregate_name(objective_config.get("aggregate", "median")),
+        _direction_name(direction),
+        output_dir,
+        _yes_no(_TASK_LOGS),
+        _HEARTBEAT_SECONDS,
+    )
+    coarse_windows, coarse_summaries, fine_windows, fine_summaries, selections = [], [], [], [], []
+    factor_runs = []
+    for factor_position, (factor_id, factor_config) in enumerate(factors.items(), 1):
+        factor_started = time.perf_counter()
+        if not isinstance(factor_config, Mapping):
+            raise TypeError(f"factor {factor_id} configuration must be a mapping")
+        module = str(factor_config.get("module") or "")
+        if not module:
+            raise ValueError(f"factor {factor_id} is missing module")
+        if str(factor_config.get("execution_mode", "")).lower() not in {"precomputed", "rolling_fit"}:
+            raise ValueError(f"factor {factor_id} requires execution_mode=precomputed or rolling_fit")
+        parameter_specs = dict(factor_config.get("parameters") or {})
+        if str(factor_id).upper().startswith("ALPHA"):
+            number = int(str(factor_id).upper().replace("ALPHA", ""))
+            parameter_specs.setdefault("alpha_id", {"type": "int", "low": number, "high": number, "step": 1})
+        validate_parameter_specs(parameter_specs)
+        _LOGGER.info(
+            "开始处理第%d/%d个因子：因子=%s，模块=%s，执行模式=%s，待挖掘参数=%s",
+            factor_position,
+            len(factors),
+            factor_id,
+            module,
+            _mode_name(factor_config.get("execution_mode")),
+            ",".join(parameter_specs),
+        )
+        sample = {name: spec.get("high", (spec.get("choices") or [None])[0]) for name, spec in parameter_specs.items()}
+        sample["factor_id"] = factor_id
+        factor_evaluation = {**evaluation, **dict(factor_config.get("evaluation") or {})}
+        if nav_staging is not None:
+            factor_evaluation["_nav_staging"] = str(nav_staging)
+        imported_spec = _import_spec(module, sample)
+        declared_mode = factor_config.get("execution_mode")
+        if declared_mode and str(declared_mode).lower() != str(imported_spec.execution_mode).lower():
+            raise ValueError(
+                f"factor {factor_id} execution_mode={declared_mode} does not match "
+                f"make_mining_spec={imported_spec.execution_mode}"
+            )
+        data = _fetch_data(imported_spec, (str(span[0]), str(span[1])), performance, sample)
+        coarse_config = search.get("coarse") or {}
+        _LOGGER.info(
+            "开始生成粗搜候选：因子=%s，采样器=%s，计划试验数=%d，随机种子=%s",
+            factor_id,
+            coarse_config.get("sampler", "random"),
+            max(1, int(coarse_config.get("n_trials", 32))),
+            coarse_config.get("seed", 20260818),
+        )
+        coarse_study = create_coarse_study(coarse_config, direction=direction)
+        coarse_trials, coarse_candidates = _ask_candidates(
+            coarse_study,
+            parameter_specs,
+            max(1, int(coarse_config.get("n_trials", 32))),
+        )
+        for value in coarse_candidates:
+            value.setdefault("factor_id", factor_id)
+        _LOGGER.info(
+            "粗搜候选已生成：因子=%s，去重后候选=%d，每个候选窗口=%d，窗口任务总数=%d",
+            factor_id,
+            len(coarse_candidates),
+            len(windows),
+            len(coarse_candidates) * len(windows),
+        )
+        coarse = _evaluate_stage(module, str(factor_id), coarse_candidates, "coarse", windows, data, factor_evaluation, runtime)
+        coarse_summary = _summary(coarse, selection)
+        _LOGGER.info(
+            "粗搜筛选完成：因子=%s，汇总候选=%d，进入细搜=%d，被过滤=%d",
+            factor_id,
+            len(coarse_summary),
+            int((coarse_summary.selection_status == "selected").sum()) if not coarse_summary.empty else 0,
+            int((coarse_summary.selection_status == "filtered").sum()) if not coarse_summary.empty else 0,
+        )
+        _tell_candidates(coarse_study, coarse_trials, coarse_candidates, str(factor_id), coarse_summary)
+        coarse_windows.append(coarse)
+        coarse_summaries.append(coarse_summary)
+        fine_config = search.get("fine") or {}
+        anchors = []
+        if not coarse_summary.empty:
+            for candidate in coarse_summary.loc[coarse_summary.selection_status == "selected", "candidate_id"].head(int(fine_config.get("top_k", 8))):
+                row = coarse[coarse.candidate_id == candidate].iloc[0]
+                anchors.append({name: row[name] for name in parameter_specs})
+        fine_candidates = generate_fine_candidates(
+            parameter_specs,
+            anchors,
+            fine_config,
+            coarse_candidates=coarse_candidates,
+        )
+        _LOGGER.info(
+            "开始生成细搜网格：因子=%s，优胜锚点=%d，初步网格候选=%d，每维点数=%d，候选上限=%d",
+            factor_id,
+            len(anchors),
+            len(fine_candidates),
+            int(fine_config.get("points_per_dimension", 7)),
+            int(fine_config.get("max_candidates", 256)),
+        )
+        fine_trials = []
+        fine_study = None
+        if fine_candidates:
+            fine_space, fine_specs = _grid_specs(parameter_specs, fine_candidates)
+            fine_study = create_fine_grid_study(
+                fine_space,
+                direction=direction,
+                seed=int((search.get("coarse") or {}).get("seed", 20260818)),
+            )
+            max_grid = math.prod(len(values) for values in fine_space.values())
+            fine_trials, fine_candidates = _ask_candidates(
+                fine_study,
+                fine_specs,
+                min(max_grid, max(1, int(fine_config.get("max_candidates", 256)))),
+            )
+            for value in fine_candidates:
+                value.setdefault("factor_id", factor_id)
+        coarse_ids = set(coarse.candidate_id) if not coarse.empty else set()
+        reused = []
+        pending = []
+        for value in fine_candidates:
+            candidate = _candidate_id(str(factor_id), value)
+            if candidate in coarse_ids:
+                rows = coarse.loc[coarse.candidate_id == candidate].copy()
+                rows["stage"] = "fine"
+                reused.append(rows)
+            else:
+                pending.append(value)
+        _LOGGER.info(
+            "细搜候选已生成：因子=%s，候选总数=%d，复用粗搜结果=%d，待计算=%d，窗口任务总数=%d",
+            factor_id,
+            len(fine_candidates),
+            len(reused),
+            len(pending),
+            len(pending) * len(windows),
+        )
+        evaluated = _evaluate_stage(module, str(factor_id), pending, "fine", windows, data, factor_evaluation, runtime)
+        fine_parts = [*reused, evaluated]
+        fine = pd.concat([value for value in fine_parts if not value.empty], ignore_index=True) if any(not value.empty for value in fine_parts) else pd.DataFrame()
+        fine_summary = _summary(fine, selection)
+        _LOGGER.info(
+            "细搜筛选完成：因子=%s，汇总候选=%d，最终入选=%d，被过滤=%d",
+            factor_id,
+            len(fine_summary),
+            int((fine_summary.selection_status == "selected").sum()) if not fine_summary.empty else 0,
+            int((fine_summary.selection_status == "filtered").sum()) if not fine_summary.empty else 0,
+        )
+        if fine_study is not None:
+            _tell_candidates(fine_study, fine_trials, fine_candidates, str(factor_id), fine_summary)
+        fine_windows.append(fine)
+        fine_summaries.append(fine_summary)
+        if not fine_summary.empty:
+            selections.append(fine_summary[fine_summary.selection_status == "selected"])
+        factor_runs.append({
+            "factor_id": str(factor_id),
+            "execution_mode": str(imported_spec.execution_mode),
+            "cache_manifest": data.cache_manifest_path,
+            "coarse_candidates": len({_candidate_id(str(factor_id), value) for value in coarse_candidates}),
+            "fine_candidates": len({_candidate_id(str(factor_id), value) for value in fine_candidates}),
+            "selected_candidates": int((fine_summary.selection_status == "selected").sum()) if not fine_summary.empty else 0,
+        })
+        _LOGGER.info(
+            "第%d/%d个因子处理完成：因子=%s，粗搜候选=%d，细搜候选=%d，最终入选=%d，耗时=%s",
+            factor_position,
+            len(factors),
+            factor_id,
+            factor_runs[-1]["coarse_candidates"],
+            factor_runs[-1]["fine_candidates"],
+            factor_runs[-1]["selected_candidates"],
+            _elapsed(factor_started),
+        )
+    coarse_window = pd.concat(coarse_windows, ignore_index=True) if coarse_windows else pd.DataFrame()
+    coarse_summary = pd.concat(coarse_summaries, ignore_index=True) if coarse_summaries else pd.DataFrame()
+    fine_window = pd.concat(fine_windows, ignore_index=True) if fine_windows else pd.DataFrame()
+    fine_summary = pd.concat(fine_summaries, ignore_index=True) if fine_summaries else pd.DataFrame()
+    selected = pd.concat(selections, ignore_index=True) if selections else pd.DataFrame()
+    _LOGGER.info(
+        "开始汇总并写入结果：粗搜窗口结果=%d条，粗搜候选=%d，细搜窗口结果=%d条，细搜候选=%d，最终入选=%d",
+        len(coarse_window),
+        len(coarse_summary),
+        len(fine_window),
+        len(fine_summary),
+        len(selected),
+    )
+    output_files = []
+    output_files.append(_write_frame(coarse_window, output_dir / "coarse_window_results.parquet", output_config.get("window_results", "parquet")))
+    coarse_summary_path = output_dir / "coarse_summary.csv"
+    coarse_summary.to_csv(coarse_summary_path, index=False, encoding="utf-8-sig")
+    output_files.append(coarse_summary_path)
+    output_files.append(_write_frame(fine_window, output_dir / "fine_window_results.parquet", output_config.get("window_results", "parquet")))
+    fine_summary_path = output_dir / "fine_summary.csv"
+    fine_summary.to_csv(fine_summary_path, index=False, encoding="utf-8-sig")
+    output_files.append(fine_summary_path)
+    selected_csv_path = output_dir / "selected_candidates.csv"
+    selected.to_csv(selected_csv_path, index=False, encoding="utf-8-sig")
+    output_files.append(selected_csv_path)
+    selected_yaml_path = output_dir / "selected_candidates.yaml"
+    selected_yaml_path.write_text(yaml.safe_dump(selected.to_dict(orient="records"), allow_unicode=True, sort_keys=False), encoding="utf-8")
+    output_files.append(selected_yaml_path)
+    if not selected.empty:
+        for row in selected.to_dict(orient="records"):
+            _LOGGER.info(
+                "候选最终入选：因子=%s，候选=%s，目标值=%s，参数=%s",
+                row.get("factor_id"),
+                row.get("candidate_id"),
+                row.get("objective"),
+                row.get("params_json"),
+            )
+    errors = pd.concat([value for value in (coarse_window, fine_window) if not value.empty], ignore_index=True) if not coarse_window.empty or not fine_window.empty else pd.DataFrame()
+    errors_path = output_dir / "errors.jsonl"
+    with errors_path.open("w", encoding="utf-8") as stream:
+        if not errors.empty:
+            for record in errors[errors.error.notna()].to_dict(orient="records"):
+                stream.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+    output_files.append(errors_path)
+    selected_nav_directory = _publish_selected_nav(
+        nav_staging,
+        output_dir,
+        set(selected.candidate_id) if not selected.empty else set(),
+    )
+    manifest = {
+        "run_id": run_id,
+        "status": "complete",
+        "started_at": started_at,
+        "completed_at": pd.Timestamp.now(tz="UTC").isoformat(),
+        "elapsed_seconds": round(time.perf_counter() - run_started, 3),
+        "parameter_config": str(parameter_path),
+        "performance_config": str(performance_path),
+        "audit_log": str(audit_path),
+        "factor_class": parameters_config.get("factor_class"),
+        "factors": factor_runs,
+        "windows": {"lengths": lengths, "steps": steps, "count": len(windows)},
+        "runtime": dict(runtime),
+        "cache": dict(cache_config),
+        "output": dict(output_config),
+        "result_rows": {
+            "coarse_windows": len(coarse_window),
+            "fine_windows": len(fine_window),
+            "selected_candidates": len(selected),
+        },
+        "selected_nav_directory": str(selected_nav_directory) if selected_nav_directory else None,
+    }
+    manifest_path = _ACTIVE_RUN_MANIFEST_PATH
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    _ACTIVE_RUN_MANIFEST = manifest
+    output_files.append(manifest_path)
+    for path in output_files:
+        _LOGGER.info("结果文件已写入：路径=%s，大小=%s", path, _human_bytes(path.stat().st_size))
+    _LOGGER.info(
+        "参数挖掘完成：运行编号=%s，最终入选=%d，错误窗口=%d，总耗时=%s，输出目录=%s，审计日志=%s",
+        run_id,
+        len(selected),
+        int(errors.error.notna().sum()) if not errors.empty else 0,
+        _elapsed(run_started),
+        output_dir,
+        audit_path,
+    )
+    return MiningResult(coarse_window, coarse_summary, fine_window, fine_summary, selected, output_dir)
+
+
+def run_mining(parameter_config_path: str | Path, performance_config_path: str | Path) -> MiningResult:
+    """Run mining with live console progress and a persistent audit log."""
+    try:
+        return _run_mining(parameter_config_path, performance_config_path)
+    except Exception as exc:
+        if _LOGGER.handlers:
+            _LOGGER.exception("参数挖掘失败：错误类型=%s，错误信息=%s", type(exc).__name__, exc)
+        if _ACTIVE_RUN_MANIFEST is not None and _ACTIVE_RUN_MANIFEST_PATH is not None:
+            failed = {
+                **_ACTIVE_RUN_MANIFEST,
+                "status": "failed",
+                "failed_at": pd.Timestamp.now(tz="UTC").isoformat(),
+                "error": f"{type(exc).__name__}: {exc}",
+                "traceback": traceback.format_exc(),
+            }
+            _ACTIVE_RUN_MANIFEST_PATH.write_text(
+                json.dumps(failed, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
         raise
     finally:
-        if owns_executor:
-            executor.shutdown(wait=True, cancel_futures=True)
-    return pd.DataFrame(rows)
+        _close_mining_logging()
 
 
-def tally_champions(
-    df: pd.DataFrame,
-    *,
-    objective: str = "sharpe",
-    higher_is_better: bool = True,
-) -> pd.DataFrame:
-    if df.empty or objective not in df.columns:
-        return pd.DataFrame()
-    ok = df[df["error"].isna()] if "error" in df.columns else df
-    ok = ok[ok[objective].notna()]
-    champions = []
-    for (scheme, win_start, win_end), group in ok.groupby(["scheme", "win_start", "win_end"]):
-        idx = group[objective].idxmax() if higher_is_better else group[objective].idxmin()
-        best = group.loc[idx]
-        champions.append({
-            "scheme": scheme,
-            "win_start": win_start,
-            "win_end": win_end,
-            "gid": best["gid"],
-            objective: best[objective],
-        })
-    champion_df = pd.DataFrame(champions)
-    if champion_df.empty:
-        return champion_df
-    return (
-        champion_df.groupby("gid")
-        .agg(
-            wins_count=("gid", "size"),
-            avg_champ_score=(objective, "mean"),
-            champ_windows=("win_start", lambda s: list(s)),
-        )
-        .reset_index()
-        .sort_values(["wins_count", "avg_champ_score"], ascending=[False, not higher_is_better])
-        .reset_index(drop=True)
-    )
-
-
-def _sort_results(df: pd.DataFrame, objective: str, higher_is_better: bool) -> pd.DataFrame:
-    if df.empty or objective not in df.columns:
-        return df
-    return df.sort_values(objective, ascending=not higher_is_better).reset_index(drop=True)
-
-
-def run_parameter_sweep(config: ParameterSweepConfig) -> pd.DataFrame:
-    output_dir = _as_path(config.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    combos = build_grid_combos(
-        config.grid,
-        factor_module=config.factor_module,
-        gid_factory=config.gid_factory,
-    )
-    if not combos:
-        return pd.DataFrame()
-
-    print(f"=== Parameter sweep (engine={config.engine}, workers={config.workers}) ===")
-    print(f"grid combos={len(combos)}  span={config.span[0]}~{config.span[1]}")
-    cache_paths = build_cache_for_config(config, [config.span], combos[0]["params"])
-    tasks = build_sweep_tasks(config, combos)
-    df = run_tasks(config, tasks, cache_paths)
-    df = _sort_results(df, config.objective, config.objective_higher_is_better)
-    df.to_csv(output_dir / config.results_filename, index=False, encoding="utf-8-sig")
-    return df
-
-
-def _run_paired_walk_forward(
-    config: RollingMiningConfig,
-    output_dir: Path,
-    combos: Sequence[Mapping[str, Any]],
-) -> dict[str, pd.DataFrame]:
-    """Run a true rolling train -> immediately-following-test schedule."""
-    paired_schemes = list(config.paired_schemes or [])
-    if not paired_schemes:
-        raise ValueError("rolling_mode='paired' requires paired_schemes")
-    rolling_span = config.rolling_span or (config.train[0], config.test[1])
-    rolling_start, rolling_end = rolling_span
-
-    cache_paths = build_cache_for_config(
-        config,
-        [rolling_span, config.valid],
-        combos[0]["params"],
-    )
-    train_frames = []
-    test_pairs: list[tuple[str, str, str, str, str]] = []
-    print(f"\n[TRAIN->TEST] paired rolling schemes={paired_schemes}")
-    for train_len, test_len, step in paired_schemes:
-        scheme = f"paired/{train_len}/{test_len}/{step}"
-        pairs = gen_rolling_train_test_windows(
-            rolling_start,
-            rolling_end,
-            train_len,
-            test_len,
-            step,
-            cap=config.max_windows_per_scheme,
-        )
-        if not pairs:
-            print(f"  [{scheme}] no complete train/test pairs")
-            continue
-        test_pairs.extend((a, b, c, d, scheme) for a, b, c, d in pairs)
-        tasks = build_paired_tasks(
-            config=config,
-            phase="train",
-            pairs=pairs,
-            scheme=scheme,
-            combos=combos,
-        )
-        print(f"  [{scheme}] train windows={len(pairs)} tasks={len(tasks)}")
-        train_frames.append(run_tasks(config, tasks, cache_paths))
-
-    train_df = pd.concat(train_frames, ignore_index=True) if train_frames else pd.DataFrame()
-    train_df.to_csv(output_dir / "train_results.csv", index=False, encoding="utf-8-sig")
-    train_tally = tally_champions(
-        train_df,
-        objective=config.objective,
-        higher_is_better=config.objective_higher_is_better,
-    )
-    train_tally.to_csv(output_dir / "train_champions.csv", index=False, encoding="utf-8-sig")
-    if train_tally.empty:
-        print("  [TRAIN] no valid result")
-        return {"train_results": train_df, "train_champions": train_tally}
-
-    counts = train_tally["wins_count"].values
-    p_low, p_high = np.percentile(
-        counts,
-        [config.candidate_percentile[0] * 100, config.candidate_percentile[1] * 100],
-    )
-    candidates = train_tally[train_tally["wins_count"] >= p_low]
-    candidates.to_csv(output_dir / "train_candidates.csv", index=False, encoding="utf-8-sig")
-    print(
-        f"  wins_count P{config.candidate_percentile[0] * 100:.0f}={p_low:.1f} "
-        f"P{config.candidate_percentile[1] * 100:.0f}={p_high:.1f} candidates={len(candidates)}"
-    )
-    candidate_gids = set(candidates["gid"])
-    candidate_combos = [combo for combo in combos if combo["gid"] in candidate_gids]
-
-    test_frames = []
-    for train_start, train_end, test_start, test_end, scheme in test_pairs:
-        tasks = build_paired_tasks(
-            config=config,
-            phase="test",
-            pairs=[(train_start, train_end, test_start, test_end)],
-            scheme=scheme,
-            combos=candidate_combos,
-        )
-        test_frames.append(run_tasks(config, tasks, cache_paths))
-    test_df = pd.concat(test_frames, ignore_index=True) if test_frames else pd.DataFrame()
-    test_df.to_csv(output_dir / "test_results.csv", index=False, encoding="utf-8-sig")
-    test_tally = tally_champions(
-        test_df,
-        objective=config.objective,
-        higher_is_better=config.objective_higher_is_better,
-    )
-    test_tally.to_csv(output_dir / "test_champions.csv", index=False, encoding="utf-8-sig")
-    if test_tally.empty:
-        print("  [TEST] no valid result")
-        return {
-            "train_results": train_df,
-            "train_champions": train_tally,
-            "train_candidates": candidates,
-            "test_results": test_df,
-            "test_champions": test_tally,
-        }
-
-    top = test_tally.head(config.report_top_n)
-    print(f"  [TEST] top {len(top)}:")
-    print(top.to_string(index=False))
-    combo_by_gid = {combo["gid"]: combo for combo in combos}
-
-    valid_tasks = []
-    for rank, gid in enumerate(top["gid"].tolist(), 1):
-        combo = combo_by_gid[gid]
-        params = dict(combo["params"])
-        valid_tasks.append({
-            "params": params,
-            "gid": combo["gid"],
-            "rank": rank,
-            "factor_module": config.factor_module,
-            "spec_factory": config.spec_factory,
-            "weight_hook": config.weight_hook,
-            "warmup_days": _warmup_days(config, params),
-            "phase": "valid",
-            "scheme": "full",
-            "win_start": config.valid[0],
-            "win_end": config.valid[1],
-            "engine": config.engine,
-            "rebal_freq": config.rebal_freq,
-            "n_quantiles_param": config.n_quantiles_param,
-            "initial_amount": config.initial_amount,
-            "time_tolerance": config.time_tolerance,
-        })
-    valid_df = run_tasks(config, valid_tasks, cache_paths)
-    if not valid_df.empty and "rank" in valid_df.columns:
-        valid_df = valid_df.sort_values("rank").reset_index(drop=True)
-    valid_df.to_csv(output_dir / "valid_results.csv", index=False, encoding="utf-8-sig")
-
-    if config.valid_report_hook:
-        for rank, gid in enumerate(top["gid"].tolist(), 1):
-            try:
-                _call_module_function(
-                    config.factor_module,
-                    config.valid_report_hook,
-                    combo_by_gid[gid]["params"],
-                    rank,
-                    str(output_dir),
-                    config.valid[0],
-                    config.valid[1],
-                )
-            except Exception as exc:
-                print(f"  [valid report] #{rank} failed: {exc}")
-
-    return {
-        "train_results": train_df,
-        "train_champions": train_tally,
-        "train_candidates": candidates,
-        "test_results": test_df,
-        "test_champions": test_tally,
-        "valid_results": valid_df,
-    }
-
-
-def run_walk_forward(config: RollingMiningConfig) -> dict[str, pd.DataFrame]:
-    output_dir = _as_path(config.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    if config.sampler:
-        from betalens.factor.mining_optuna import run_optuna_walk_forward
-
-        return run_optuna_walk_forward(config)
-    combos = build_grid_combos(
-        config.grid,
-        factor_module=config.factor_module,
-        gid_factory=config.gid_factory,
-    )
-    if not combos:
-        return {}
-
-    if config.rolling_mode == "paired":
-        return _run_paired_walk_forward(config, _as_path(config.output_dir), combos)
-    if config.rolling_mode != "split":
-        raise ValueError(f"unknown rolling_mode: {config.rolling_mode!r}")
-
-    print(
-        f"=== Walk-forward mining (engine={config.engine}, workers={config.workers}) ==="
-    )
-    print(
-        f"grid combos={len(combos)}  train schemes={list(config.train_schemes)}  "
-        f"test schemes={list(config.test_schemes)}"
-    )
-    cache_paths = build_cache_for_config(
-        config,
-        [config.train, config.test, config.valid],
-        combos[0]["params"],
-    )
-
-    print(f"\n[TRAIN] {config.train[0]}~{config.train[1]}")
-    train_tasks = build_tasks(
-        config=config,
-        phase="train",
-        span=config.train,
-        schemes=config.train_schemes,
-        combos=combos,
-        cap=config.max_windows_per_scheme,
-    )
-    print(f"  tasks={len(train_tasks)}")
-    train_df = run_tasks(config, train_tasks, cache_paths)
-    train_df.to_csv(output_dir / "train_results.csv", index=False, encoding="utf-8-sig")
-    train_tally = tally_champions(
-        train_df,
-        objective=config.objective,
-        higher_is_better=config.objective_higher_is_better,
-    )
-    train_tally.to_csv(output_dir / "train_champions.csv", index=False, encoding="utf-8-sig")
-    if train_tally.empty:
-        print("  [TRAIN] no valid result")
-        return {"train_results": train_df, "train_champions": train_tally}
-
-    counts = train_tally["wins_count"].values
-    p_low, p_high = np.percentile(
-        counts,
-        [config.candidate_percentile[0] * 100, config.candidate_percentile[1] * 100],
-    )
-    candidates = train_tally[train_tally["wins_count"] >= p_low]
-    candidates.to_csv(output_dir / "train_candidates.csv", index=False, encoding="utf-8-sig")
-    print(
-        f"  wins_count P{config.candidate_percentile[0] * 100:.0f}={p_low:.1f} "
-        f"P{config.candidate_percentile[1] * 100:.0f}={p_high:.1f}  "
-        f"candidates={len(candidates)}"
-    )
-    print(train_tally.head(10).to_string(index=False))
-
-    candidate_gids = set(candidates["gid"])
-    candidate_combos = [combo for combo in combos if combo["gid"] in candidate_gids]
-
-    print(f"\n[TEST] {config.test[0]}~{config.test[1]}  candidates={len(candidate_combos)}")
-    test_tasks = build_tasks(
-        config=config,
-        phase="test",
-        span=config.test,
-        schemes=config.test_schemes,
-        combos=candidate_combos,
-        cap=config.max_windows_per_scheme,
-    )
-    print(f"  tasks={len(test_tasks)}")
-    test_df = run_tasks(config, test_tasks, cache_paths)
-    test_df.to_csv(output_dir / "test_results.csv", index=False, encoding="utf-8-sig")
-    test_tally = tally_champions(
-        test_df,
-        objective=config.objective,
-        higher_is_better=config.objective_higher_is_better,
-    )
-    test_tally.to_csv(output_dir / "test_champions.csv", index=False, encoding="utf-8-sig")
-    if test_tally.empty:
-        print("  [TEST] no valid result")
-        return {
-            "train_results": train_df,
-            "train_champions": train_tally,
-            "test_results": test_df,
-            "test_champions": test_tally,
-        }
-    top = test_tally.head(config.report_top_n)
-    print(f"  TEST top {len(top)}:")
-    print(top.to_string(index=False))
-
-    print(f"\n[VALID] {config.valid[0]}~{config.valid[1]}")
-    combo_by_gid = {combo["gid"]: combo for combo in combos}
-    valid_tasks = []
-    for rank, gid in enumerate(top["gid"].tolist(), 1):
-        combo = combo_by_gid[gid]
-        params = dict(combo["params"])
-        valid_tasks.append({
-            "params": params,
-            "gid": combo["gid"],
-            "rank": rank,
-            "factor_module": config.factor_module,
-            "spec_factory": config.spec_factory,
-            "weight_hook": config.weight_hook,
-            "warmup_days": _warmup_days(config, params),
-            "phase": "valid",
-            "scheme": "full",
-            "win_start": config.valid[0],
-            "win_end": config.valid[1],
-            "engine": config.engine,
-            "rebal_freq": config.rebal_freq,
-            "n_quantiles_param": config.n_quantiles_param,
-            "initial_amount": config.initial_amount,
-            "time_tolerance": config.time_tolerance,
-        })
-
-    valid_df = run_tasks(config, valid_tasks, cache_paths)
-    if not valid_df.empty and "rank" in valid_df.columns:
-        valid_df = valid_df.sort_values("rank").reset_index(drop=True)
-    valid_df.to_csv(output_dir / "valid_results.csv", index=False, encoding="utf-8-sig")
-
-    if config.valid_report_hook:
-        for rank, gid in enumerate(top["gid"].tolist(), 1):
-            params = combo_by_gid[gid]["params"]
-            try:
-                _call_module_function(
-                    config.factor_module,
-                    config.valid_report_hook,
-                    params,
-                    rank,
-                    str(output_dir),
-                    config.valid[0],
-                    config.valid[1],
-                )
-            except Exception as exc:
-                print(f"  [valid report] #{rank} failed: {exc}")
-
-    if not valid_df.empty:
-        best = valid_df.iloc[0]
-        print(f"\n=== best gid={best['gid']}  valid {config.objective}={best.get(config.objective)} ===")
-    print(f"output dir: {output_dir}")
-    return {
-        "train_results": train_df,
-        "train_champions": train_tally,
-        "train_candidates": candidates,
-        "test_results": test_df,
-        "test_champions": test_tally,
-        "valid_results": valid_df,
-    }
+__all__ = [
+    "MiningData",
+    "MiningResult",
+    "MiningSpec",
+    "MiningWindow",
+    "metrics_from_nav",
+    "run_mining",
+    "validate_parameter_specs",
+]

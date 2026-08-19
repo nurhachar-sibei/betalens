@@ -48,14 +48,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    volume_delta_lag:
-    - 1
-    - 2
-    - 4
-    rank_delta_volume_rank_open_close_correlation_window:
-    - 3
-    - 6
-    - 12

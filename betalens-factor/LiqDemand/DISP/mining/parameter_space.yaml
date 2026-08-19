@@ -1,0 +1,59 @@
+version: 1
+factor_class: DISP
+
+factors:
+  DISP:
+    module: factor_DISP
+    execution_mode: precomputed
+    parameters:
+      window:
+        type: int
+        low: 20
+        high: 500
+        step: 5
+        scale: linear
+      pretom:
+        type: categorical
+        choices: [[9, 4], [7, 4]]
+      pretom_only:
+        type: categorical
+        choices: [true, false]
+      n_quantiles:
+        type: int
+        low: 10
+        high: 40
+        step: 10
+
+evaluation:
+  span: ["2010-01-01", "2022-12-31"]
+  rebal_freq: D
+  engine: vector
+  initial_amount: 100000000
+
+windows:
+  lengths: [252, 504]
+  steps: [21, 63]
+
+search:
+  coarse:
+    sampler: random
+    n_trials: 64
+    seed: 20260818
+  fine:
+    top_k: 8
+    points_per_dimension: 7
+    max_candidates: 256
+
+selection:
+  objective:
+    metric: sharpe
+    aggregate: median
+    direction: maximize
+  filters:
+    - metric: valid_window_ratio
+      op: ">="
+      value: 0.8
+    - metric: max_mdd
+      op: "<="
+      value: 0.35
+  top_k: 10

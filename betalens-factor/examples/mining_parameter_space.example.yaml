@@ -1,0 +1,48 @@
+version: 1
+factor_class: sample
+
+factors:
+  SAMPLE:
+    module: factor_SAMPLE
+    execution_mode: precomputed
+    parameters:
+      window:
+        type: int
+        low: 20
+        high: 500
+        step: 1
+        scale: log
+      n_quantiles:
+        type: categorical
+        choices: [10, 20]
+
+evaluation:
+  span: ["2010-01-01", "2022-12-31"]
+  rebal_freq: W
+  engine: vector
+  initial_amount: 100000000
+
+windows:
+  lengths: [252, 504]
+  steps: [21, 63]
+
+search:
+  coarse:
+    sampler: random
+    n_trials: 64
+    seed: 20260818
+  fine:
+    top_k: 8
+    points_per_dimension: 7
+    max_candidates: 256
+
+selection:
+  objective:
+    metric: sharpe
+    aggregate: median
+    direction: maximize
+  filters:
+    - metric: valid_window_ratio
+      op: ">="
+      value: 0.8
+  top_k: 10

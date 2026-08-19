@@ -13,15 +13,16 @@
      <factor_class>/
        class_<factor_class>.yaml
        factor_template_<factor_class>.py
+       mining/
+         parameter_space.yaml
+         performance.yaml
+         run.py
        <FACTOR_NAME>/
          factor_<FACTOR_NAME>.py
          factor_<FACTOR_NAME>.yaml
          outputs/
            legacy/
            runs/
-         mining/
-           sweep_window.py
-           sweep_window.yaml
 
 规则：
 
@@ -29,7 +30,7 @@
 * 因子目录必须有 ``factor_<name>.py`` 和 ``factor_<name>.yaml``。
 * Dashboard 按 ``<class>/<name>/factor_<name>.py`` 动态导入脚本。
 * 新运行写入 ``outputs/runs/<run_id-or-manual>/``。
-* 参数挖掘入口放在 ``mining/``。
+* 参数挖掘在类目录的 ``mining/`` 中集中配置，单因子 YAML 不包含挖掘参数。
 
 YAML 结构
 ---------

@@ -41,21 +41,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    rank_stddev_returns_complement_base:
-    - 1
-    returns_stddev_window:
-    - 1
-    - 2
-    - 4
-    returns_stddev_window_2:
-    - 3
-    - 5
-    - 10
-    rank_delta_close_complement_base:
-    - 1
-    close_delta_lag:
-    - 1
-    - 2

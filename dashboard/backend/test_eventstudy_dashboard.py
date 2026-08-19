@@ -11,7 +11,7 @@ from betalens.eventstudy.eventstudy import EventStudy
 from . import eventstudy_dashboard
 from .eventstudy_dashboard import (
     _comparison_payload,
-    _cumulative_matrix_records,
+    _price_matrix_records,
     _asset_payload,
     _parse_codes,
     discover_event_files,
@@ -41,7 +41,7 @@ class EventStudyDashboardTests(unittest.TestCase):
         files = payload["files"]
 
         self.assertIn("defaults", payload)
-        self.assertEqual(payload["defaults"]["event_file"], "1.春节假期.xlsx")
+        self.assertEqual(payload["defaults"]["event_file"], configured_defaults["event_file"])
         self.assertEqual(payload["defaults"]["code"], configured_defaults["code"])
         self.assertGreaterEqual(len(files), 1)
         self.assertTrue(any(item["id"] == "1.春节假期.xlsx" for item in files))
@@ -49,7 +49,7 @@ class EventStudyDashboardTests(unittest.TestCase):
         self.assertIn("date", first["columns"])
         self.assertGreater(first["eventCount"], 0)
 
-    def test_flexible_cumulative_uses_holding_start_offset(self) -> None:
+    def test_fixed_holding_returns_use_holding_start_offset(self) -> None:
         returns = pd.DataFrame(
             {
                 0: {-1: 0.01, 0: 0.02, 1: 0.03, 2: 0.04},
@@ -57,20 +57,21 @@ class EventStudyDashboardTests(unittest.TestCase):
             }
         ).sort_index()
 
-        cumulative = EventStudy(None)._calc_cumulative_flexible(returns, holding_start_offset=1)
+        holding, stats = EventStudy(None)._calc_holding_returns(
+            returns, {"days": [1], "months": []}, holding_start_offset=1
+        )
 
-        self.assertAlmostEqual(cumulative.loc[1, 0], 0.03)
-        self.assertAlmostEqual(cumulative.loc[1, 1], 0.02)
-        self.assertAlmostEqual(cumulative.loc[2, 0], (1.03 * 1.04) - 1)
-        self.assertAlmostEqual(cumulative.loc[0, 0], (1.02 * 1.03) - 1)
-        self.assertAlmostEqual(cumulative.loc[-1, 1], (0.99 * 1.01 * 1.02) - 1)
+        self.assertAlmostEqual(holding.loc[2, 0], 0.04)
+        self.assertAlmostEqual(holding.loc[2, 1], 0.03)
+        self.assertEqual(stats.loc[2, "holding_period"], "1日")
 
     def test_comparison_payload_is_json_safe_and_preserves_event_ids(self) -> None:
         daily = pd.DataFrame(
             {"mean": [0.01], "std": [0.0], "positive_prob": [1.0], "odds": [np.inf], "t_stat": [np.nan], "count": [1]},
             index=pd.Index([0], name="day"),
         )
-        cumulative = daily.copy()
+        holding = daily.copy()
+        holding["holding_period"] = "1日"
         raw = {
             "comparison": {
                 "events": [
@@ -84,21 +85,21 @@ class EventStudyDashboardTests(unittest.TestCase):
                         "event_count": 2,
                         "coverage": 1.0,
                         "daily_stats": daily,
-                        "cumulative_stats": cumulative,
-                        "cumulative_returns_matrix": pd.DataFrame({0: {0: 0.01}, 1: {0: 0.02}}),
+                        "holding_stats": holding,
+                        "price_matrix": pd.DataFrame({0: {0: 0.0}, 1: {0: 0.0}}),
                     },
                     "B": {
                         "event_count": 1,
                         "coverage": 0.5,
                         "daily_stats": daily,
-                        "cumulative_stats": cumulative,
-                        "cumulative_returns_matrix": pd.DataFrame({0: {0: 0.03}, 1: {0: np.nan}}),
+                        "holding_stats": holding,
+                        "price_matrix": pd.DataFrame({0: {0: 0.0}, 1: {0: np.nan}}),
                     },
                 },
             }
         }
 
-        payload = _comparison_payload(raw, 0)
+        payload = _comparison_payload(raw)
 
         self.assertIsNotNone(payload)
         assert payload is not None
@@ -106,11 +107,11 @@ class EventStudyDashboardTests(unittest.TestCase):
         self.assertEqual(payload["events"][1]["eventDate"], "2024-01-10 10:00:00")
         self.assertEqual(payload["summaryByCode"][1]["coverage"], 0.5)
         self.assertIsNone(payload["summaryByCode"][0]["day0TStat"])
-        self.assertEqual(len(payload["eventCumulativeByCode"]), 4)
+        self.assertEqual(len(payload["eventPriceByCode"]), 4)
 
     def test_matrix_records_use_stable_event_id_for_date_lookup(self) -> None:
         event_dates = pd.DatetimeIndex(["2024-01-03", "2024-01-10"])
-        records = _cumulative_matrix_records(
+        records = _price_matrix_records(
             pd.DataFrame({1: {0: 0.01}}), event_dates=event_dates
         )
 
@@ -221,9 +222,9 @@ class EventStudyDashboardTests(unittest.TestCase):
             "event_count": 1,
             "valid_codes": ["A", "B"],
             "daily_stats": pd.DataFrame({"mean": [0.01], "t_stat": [np.nan], "positive_prob": [1.0]}, index=[0]),
-            "cumulative_stats": pd.DataFrame({"mean": [0.01], "t_stat": [np.nan], "positive_prob": [1.0]}, index=[0]),
+            "holding_stats": pd.DataFrame({"holding_period": ["1日"], "mean": [0.01], "t_stat": [np.nan], "positive_prob": [1.0]}, index=[1]),
             "returns_matrix": pd.DataFrame({0: {0: 0.01}}),
-            "cumulative_returns_matrix": pd.DataFrame({0: {0: 0.01}}),
+            "price_matrix": pd.DataFrame({0: {0: 0.0}}),
             "event_dates": pd.DatetimeIndex(["2024-01-03"]),
         }
 

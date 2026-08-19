@@ -49,18 +49,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    indneutralize_vwap_sector_volume_correlation_window:
-    - 1.963975
-    - 3.92795
-    - 7.8559
-    value_decay_window:
-    - 3.946455
-    - 7.89291
-    - 15.78582
-    decay_linear_value_rank_window:
-    - 2.75161
-    - 5.50322
-    - 11.00644

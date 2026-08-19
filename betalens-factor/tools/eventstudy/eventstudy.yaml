@@ -1,10 +1,9 @@
 eventstudy:
-  event_file: 1.春节假期.xlsx
-  code: 601398.SH
+  event_file: 8.牛市阶段_上证指数跌超2%交易日汇总.xlsx
+  code: 000001.SH
   benchmark_code: ''
-  metric: 收盘价(元)
-  table_name: daily_market
-  mode: flexible
+  metric: 收盘价
+  table_name: daily_index
   multi_asset_mode: aggregate
   window_before: 20
   window_after: 20
@@ -12,5 +11,5 @@ eventstudy:
   market_close_hour: 15
   holding_days: 1,2,3,4,5
   holding_months: 1,3,6,9,12
-  save_results: false
+  save_results: true
   output: outputs/eventstudy_results.xlsx

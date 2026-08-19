@@ -54,28 +54,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    vwap_delta_lag:
-    - 2.363875
-    - 4.72775
-    - 9.4555
-    delta_vwap_decay_window:
-    - 1.45932
-    - 2.91864
-    - 5.83728
-    open_mix_weight:
-    - 0.0735775
-    - 0.147155
-    - 0.2207325
-    mixed_complement_base:
-    - 1
-    mixed_complement_weight:
-    - 0.147155
-    mixed_delta_lag:
-    - 2.03608
-    mixed_delta_decay_window:
-    - 3.33829
-    decay_linear_mixed_delta_rank_window:
-    - 16.7411

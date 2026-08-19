@@ -47,30 +47,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    close_mix_weight:
-    - 0.1848505
-    - 0.369701
-    - 0.5545515
-    mixed_complement_base:
-    - 1
-    mixed_complement_weight:
-    - 0.1848505
-    - 0.369701
-    - 0.5545515
-    mixed_delta_lag:
-    - 1.0
-    - 1.91233
-    - 3.82466
-    delta_mixed_decay_window:
-    - 2.65461
-    amount_average_window:
-    - 81
-    indneutralize_industry_adv_close_correlation_window:
-    - 13.4132
-    corr_decay_window:
-    - 4.89768
-    decay_linear_corr_rank_window:
-    - 14.4535

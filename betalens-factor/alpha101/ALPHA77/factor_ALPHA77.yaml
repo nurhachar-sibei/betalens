@@ -44,24 +44,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    high_low_divisor:
-    - 2
-    vwap_high_low_decay_window:
-    - 10.02255
-    - 20.0451
-    - 40.0902
-    high_low_divisor_2:
-    - 2
-    amount_average_window:
-    - 20
-    - 40
-    - 80
-    high_low_adv_correlation_window:
-    - 1.5807
-    - 3.1614
-    - 6.3228
-    correlation_adv_high_decay_window:
-    - 5.64125

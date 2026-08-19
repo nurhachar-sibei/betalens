@@ -48,18 +48,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    vwap_maximum_window:
-    - 7.66085
-    - 15.3217
-    - 30.6434
-    vwap_ts_max_rank_window:
-    - 10.35635
-    - 20.7127
-    - 41.4254
-    close_delta_lag:
-    - 2.48398
-    - 4.96796
-    - 9.93592

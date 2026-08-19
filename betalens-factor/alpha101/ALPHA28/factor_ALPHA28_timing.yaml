@@ -50,16 +50,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    amount_average_window:
-    - 10
-    - 20
-    - 40
-    adv_low_correlation_window:
-    - 3
-    - 5
-    - 10
-    high_low_divisor:
-    - 2

@@ -39,18 +39,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    returns_sum_window:
-    - 5
-    - 10
-    - 20
-    returns_sum_window_2:
-    - 1
-    - 2
-    - 4
-    ts_sum_returns_sum_window:
-    - 2
-    - 3
-    - 6

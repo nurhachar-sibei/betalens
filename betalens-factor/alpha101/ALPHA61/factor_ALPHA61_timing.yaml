@@ -48,18 +48,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    vwap_minimum_window:
-    - 8.06095
-    - 16.1219
-    - 32.2438
-    amount_average_window:
-    - 90
-    - 180
-    - 360
-    vwap_adv_correlation_window:
-    - 8.9641
-    - 17.9282
-    - 35.8564

@@ -56,32 +56,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    close_mean_window:
-    - 4
-    - 8
-    - 16
-    close_mean_window_2:
-    - 1
-    - 2
-    - 4
-    close_stddev_window:
-    - 4
-    - 8
-    - 16
-    close_stddev_window_2:
-    - 8
-    amount_average_window:
-    - 20
-    volume_adv_threshold:
-    - 1
-    condition1_true_value:
-    - -1.0
-    condition2_true_value:
-    - 1.0
-    volume_condition_true_value:
-    - 1.0
-    volume_condition_false_value:
-    - -1.0

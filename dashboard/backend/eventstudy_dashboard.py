@@ -201,9 +201,7 @@ def _parse_int_list(value: Any) -> list[int]:
     return result
 
 
-def _build_holding_periods(params: dict[str, Any]) -> dict[str, list[int]] | None:
-    if str(params["mode"]) != "fixed":
-        return None
+def _build_holding_periods(params: dict[str, Any]) -> dict[str, list[int]]:
     days = _parse_int_list(params["holding_days"])
     months = _parse_int_list(params["holding_months"])
     return {"days": days, "months": months}
@@ -261,7 +259,7 @@ def _returns_matrix_records(
     return rows
 
 
-def _cumulative_matrix_records(
+def _price_matrix_records(
     df: pd.DataFrame | None,
     event_dates: Any = None,
     max_events: int = 30
@@ -277,7 +275,7 @@ def _cumulative_matrix_records(
                     "day": _clean_scalar(day),
                     "event": str(event_idx),
                     "eventDate": _event_date_for_index(event_dates, event_idx),
-                    "cumulativeReturn": _clean_scalar(value),
+                    "relativePrice": _clean_scalar(value),
                 }
             )
     return rows
@@ -292,7 +290,7 @@ def _event_rows(path: Path) -> list[dict[str, Any]]:
     return [{str(k): _clean_scalar(v) for k, v in row.items()} for row in out.to_dict("records")]
 
 
-def _comparison_payload(raw: dict[str, Any], window_after: int) -> dict[str, Any] | None:
+def _comparison_payload(raw: dict[str, Any]) -> dict[str, Any] | None:
     comparison = raw.get("comparison")
     if not comparison:
         return None
@@ -306,14 +304,14 @@ def _comparison_payload(raw: dict[str, Any], window_after: int) -> dict[str, Any
     }
     summary_by_code: list[dict[str, Any]] = []
     daily_by_code: list[dict[str, Any]] = []
-    cumulative_by_code: list[dict[str, Any]] = []
-    event_cumulative_by_code: list[dict[str, Any]] = []
+    holding_by_code: list[dict[str, Any]] = []
+    event_price_by_code: list[dict[str, Any]] = []
 
     for code, item in comparison.get("by_code", {}).items():
         daily = _records(item.get("daily_stats"), "day")
-        cumulative = _records(item.get("cumulative_stats"), "day")
+        holding = _records(item.get("holding_stats"), "holding_day")
         day0 = _key_metric(daily, 0)
-        final = _key_metric(cumulative, window_after)
+        final = holding[-1] if holding else None
         summary_by_code.append(
             {
                 "code": str(code),
@@ -322,30 +320,30 @@ def _comparison_payload(raw: dict[str, Any], window_after: int) -> dict[str, Any
                 "day0Mean": day0.get("mean") if day0 else None,
                 "day0TStat": day0.get("t_stat") if day0 else None,
                 "day0PositiveProb": day0.get("positive_prob") if day0 else None,
-                "finalDay": final.get("day") if final else None,
-                "finalMean": final.get("mean") if final else None,
-                "finalTStat": final.get("t_stat") if final else None,
-                "finalPositiveProb": final.get("positive_prob") if final else None,
+                "holdingPeriod": final.get("holding_period") if final else None,
+                "holdingMean": final.get("mean") if final else None,
+                "holdingTStat": final.get("t_stat") if final else None,
+                "holdingPositiveProb": final.get("positive_prob") if final else None,
             }
         )
         daily_by_code.extend({"code": str(code), **row} for row in daily)
-        cumulative_by_code.extend({"code": str(code), **row} for row in cumulative)
+        holding_by_code.extend({"code": str(code), **row} for row in holding)
 
-        cumulative_matrix = item.get("cumulative_returns_matrix")
-        if cumulative_matrix is None or cumulative_matrix.empty:
+        price_matrix = item.get("price_matrix")
+        if price_matrix is None or price_matrix.empty:
             continue
-        for day, series in cumulative_matrix.iterrows():
+        for day, series in price_matrix.iterrows():
             for event_id, value in series.items():
                 normalized_event_id = int(event_id)
                 if normalized_event_id not in displayed_ids:
                     continue
-                event_cumulative_by_code.append(
+                event_price_by_code.append(
                     {
                         "code": str(code),
                         "eventId": normalized_event_id,
                         "eventDate": event_by_id.get(normalized_event_id),
                         "day": _clean_scalar(day),
-                        "cumulativeReturn": _clean_scalar(value),
+                        "relativePrice": _clean_scalar(value),
                     }
                 )
 
@@ -368,14 +366,17 @@ def _comparison_payload(raw: dict[str, Any], window_after: int) -> dict[str, Any
         "truncated": len(events) > len(displayed_events),
         "summaryByCode": summary_by_code,
         "dailyByCode": daily_by_code,
-        "cumulativeByCode": cumulative_by_code,
-        "eventCumulativeByCode": event_cumulative_by_code,
+        "holdingByCode": holding_by_code,
+        "eventPriceByCode": event_price_by_code,
     }
 
 
 def run_event_study(params: dict[str, Any]) -> dict[str, Any]:
     defaults = load_eventstudy_params()
     merged = {**defaults, **{k: v for k, v in params.items() if v not in (None, "")}}
+    for key in ("holding_days", "holding_months"):
+        if key in params and params[key] is not None:
+            merged[key] = params[key]
 
     file_id = str(merged.get("event_file") or merged.get("eventFile") or "")
     path = _safe_event_path(file_id)
@@ -390,7 +391,6 @@ def run_event_study(params: dict[str, Any]) -> dict[str, Any]:
     benchmark_code = str(merged.get("benchmark_code") or merged.get("benchmarkCode") or "").strip() or None
     metric = str(merged.get("metric"))
     table_name = str(merged.get("table_name") or merged.get("tableName"))
-    mode = str(merged.get("mode"))
     multi_asset_mode = str(
         _param_value(merged, "multi_asset_mode", "multiAssetMode", "aggregate")
     )
@@ -409,7 +409,6 @@ def run_event_study(params: dict[str, Any]) -> dict[str, Any]:
             window_before=window_before,
             window_after=window_after,
             metric=metric,
-            mode=mode,
             holding_periods=_build_holding_periods(merged),
             holding_start_offset=holding_start_offset,
             market_close_hour=market_close_hour,
@@ -424,9 +423,9 @@ def run_event_study(params: dict[str, Any]) -> dict[str, Any]:
     valid_codes = raw.get("valid_codes", [code] if isinstance(code, str) else code)
     assets = _asset_payload(valid_codes)
     daily = _records(raw.get("daily_stats"), "day")
-    cumulative = _records(raw.get("cumulative_stats"), "day")
+    holding = _records(raw.get("holding_stats"), "holding_day")
     day0 = _key_metric(daily, 0)
-    final = _key_metric(cumulative, window_after)
+    final = holding[-1] if holding else None
 
     result = {
         "eventFile": {
@@ -440,7 +439,6 @@ def run_event_study(params: dict[str, Any]) -> dict[str, Any]:
             "benchmarkCode": benchmark_code,
             "metric": metric,
             "tableName": table_name,
-            "mode": mode,
             "multiAssetMode": multi_asset_mode,
             "windowBefore": window_before,
             "windowAfter": window_after,
@@ -453,27 +451,26 @@ def run_event_study(params: dict[str, Any]) -> dict[str, Any]:
             "day0Mean": day0.get("mean") if day0 else None,
             "day0TStat": day0.get("t_stat") if day0 else None,
             "day0PositiveProb": day0.get("positive_prob") if day0 else None,
-            "finalDay": final.get("day") if final else None,
-            "finalMean": final.get("mean") if final else None,
-            "finalTStat": final.get("t_stat") if final else None,
-            "finalPositiveProb": final.get("positive_prob") if final else None,
+            "holdingPeriod": final.get("holding_period") if final else None,
+            "holdingMean": final.get("mean") if final else None,
+            "holdingTStat": final.get("t_stat") if final else None,
+            "holdingPositiveProb": final.get("positive_prob") if final else None,
         },
         "charts": {
             "dailyStats": daily,
-            "cumulativeStats": cumulative,
             "returnsMatrix": _returns_matrix_records(raw.get("returns_matrix"), raw.get("event_dates")),
-            "cumulativeReturnsMatrix": _cumulative_matrix_records(
-                raw.get("cumulative_returns_matrix"),
+            "priceMatrix": _price_matrix_records(
+                raw.get("price_matrix"),
                 raw.get("event_dates"),
             ),
         },
         "tables": {
             "dailyStats": daily,
-            "cumulativeStats": cumulative,
+            "holdingStats": holding,
             "events": _event_rows(path),
         },
     }
-    comparison = _comparison_payload(raw, window_after)
+    comparison = _comparison_payload(raw)
     if comparison is not None:
         result["comparison"] = comparison
     return result

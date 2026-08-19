@@ -40,12 +40,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    scale_rank_oscillator_coefficient:
-    - 2
-    close_argmax_window:
-    - 5
-    - 10
-    - 20

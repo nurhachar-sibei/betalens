@@ -42,16 +42,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    high_minimum_window:
-    - 1.072965
-    - 2.14593
-    - 4.29186
-    amount_average_window:
-    - 10
-    - 20
-    - 40
-    indneutralize_vwap_sector_indneutralize_subindustry_adv_correlation_wind:
-    - 6.02936

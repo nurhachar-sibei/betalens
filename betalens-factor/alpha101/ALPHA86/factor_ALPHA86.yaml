@@ -41,20 +41,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    amount_average_window:
-    - 10
-    - 20
-    - 40
-    adv_sum_window:
-    - 7.3722
-    - 14.7444
-    - 29.4888
-    close_ts_sum_adv_correlation_window:
-    - 3.000245
-    - 6.00049
-    - 12.00098
-    correlation_close_ts_sum_rank_window:
-    - 20.4195

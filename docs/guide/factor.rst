@@ -174,17 +174,12 @@
 
 .. code-block:: python
 
-   from betalens.factor.mining import ParameterSweepConfig, run_parameter_sweep
+   from betalens.factor.mining import run_mining
 
-   config = ParameterSweepConfig(
-       factor_module="factor_DISP",
-       output_dir="outputs/mining",
-       span=("2020-01-01", "2024-12-31"),
-       grid={"window": [60, 120, 252]},
-       engine="vector",
-       workers=1,
+   result = run_mining(
+       "betalens-factor/LiqDemand/DISP/mining/parameter_space.yaml",
+       "betalens-factor/LiqDemand/DISP/mining/performance.yaml",
    )
-   result = run_parameter_sweep(config)
 
 实践提示
 --------

@@ -49,20 +49,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    volume_rank_window:
-    - 3
-    - 5
-    - 10
-    high_rank_window:
-    - 3
-    - 5
-    - 10
-    ts_rank_volume_ts_rank_high_correlation_window:
-    - 3
-    - 5
-    - 10
-    correlation_ts_rank_volume_maximum_window:
-    - 3

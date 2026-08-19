@@ -61,6 +61,65 @@ def default_search_space(alpha_id: str | int, max_dimensions: int = 3) -> dict[s
     return search_space
 
 
+def mining_parameter_specs(alpha_id: str | int, max_dimensions: int = 3) -> dict[str, dict[str, Any]]:
+    """Convert formula metadata into the aggregate mining YAML parameter schema."""
+    values_by_name = default_search_space(alpha_id, max_dimensions=max_dimensions)
+    output = {}
+    for name, values in values_by_name.items():
+        catalog = parameter_catalog(alpha_id)[name]
+        is_float = isinstance(catalog.default, float) or any(isinstance(value, float) for value in values)
+        spec = {
+            "type": "float" if is_float else "int",
+            "low": min(values),
+            "high": max(values),
+            "scale": "log" if catalog.kind in {"window", "lag"} else "linear",
+        }
+        if not is_float:
+            spec["step"] = 1
+        output[name] = spec
+    return validate_mining_parameter_specs(alpha_id, output)
+
+
+def validate_mining_parameter_specs(
+    alpha_id: str | int,
+    parameter_specs: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Validate aggregate parameter definitions against one Alpha formula."""
+    definition = get_definition(alpha_id)
+    expected, supplied = set(definition.parameters), set(parameter_specs)
+    if expected != supplied:
+        missing, unknown = sorted(expected - supplied), sorted(supplied - expected)
+        raise ValueError(f"{definition.name} parameter specs mismatch: missing={missing}; unknown={unknown}")
+    from betalens.factor.mining import validate_parameter_specs
+
+    output = {name: dict(parameter_specs[name]) for name in definition.parameters}
+    validate_parameter_specs(output)
+    return output
+
+
+def mining_optuna_distributions(
+    alpha_id: str | int,
+    parameter_specs: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Build Optuna distributions after formula-aware validation."""
+    from betalens.factor.mining_optuna import to_optuna_distribution
+
+    validated = validate_mining_parameter_specs(alpha_id, parameter_specs)
+    return {name: to_optuna_distribution(spec) for name, spec in validated.items()}
+
+
+def aggregate_mining_factors() -> dict[str, dict[str, Any]]:
+    """Expand ``factors: all`` into the centralized Alpha101 parameter catalog."""
+    return {
+        get_definition(number).name: {
+            "module": "alpha101_mining",
+            "execution_mode": "precomputed",
+            "parameters": mining_parameter_specs(number),
+        }
+        for number in range(1, 102)
+    }
+
+
 def validate_search_space(
     alpha_id: str | int,
     search_space: Mapping[str, Sequence[Any]],
@@ -158,6 +217,10 @@ __all__ = [
     "formula_param_candidates",
     "formula_param_gid",
     "grid_candidate_count",
+    "aggregate_mining_factors",
+    "mining_optuna_distributions",
+    "mining_parameter_specs",
     "parameter_catalog",
+    "validate_mining_parameter_specs",
     "validate_search_space",
 ]

@@ -45,27 +45,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    close_delta_lag:
-    - 1
-    - 2
-    close_delay_lag:
-    - 1
-    - 2
-    delay_close_delta_lag:
-    - 1
-    - 2
-    delta_close_delta_delay_close_correlation_window:
-    - 250
-    close_delta_lag_2:
-    - 1
-    close_delta_lag_3:
-    - 1
-    close_delay_lag_2:
-    - 1
-    delta_close_delay_power_exponent:
-    - 2
-    delta_close_delay_sum_window:
-    - 250

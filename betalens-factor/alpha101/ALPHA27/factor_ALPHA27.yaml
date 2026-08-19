@@ -42,24 +42,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    rank_volume_rank_vwap_correlation_window:
-    - 3
-    - 6
-    - 12
-    correlation_rank_volume_sum_window:
-    - 1
-    - 2
-    - 4
-    ts_sum_correlation_rank_divisor:
-    - 2.0
-    value_threshold:
-    - 0.25
-    - 0.5
-    - 0.75
-    value_true_value:
-    - -1.0
-    value_false_value:
-    - 1.0

@@ -59,36 +59,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    low_mix_weight:
-    - 0.3605005
-    - 0.721001
-    - 1.0
-    mixed_complement_base:
-    - 1
-    mixed_complement_weight:
-    - 0.3605005
-    - 0.721001
-    - 1.0
-    indneutralize_mixed_industry_delta_lag:
-    - 1.68525
-    - 3.3705
-    - 6.741
-    delta_indneutralize_mixed_decay_window:
-    - 20.4523
-    low_rank_window:
-    - 7.87871
-    amount_average_window:
-    - 60
-    adv_rank_window:
-    - 17.255
-    ts_rank_low_ts_rank_adv_correlation_window:
-    - 4.97547
-    corr_rank_window:
-    - 18.5925
-    ts_rank_corr_decay_window:
-    - 15.7152
-    decay_linear_ts_rank_corr_rank_window:
-    - 6.71659

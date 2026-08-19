@@ -50,14 +50,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    close_mean_window:
-    - 3
-    - 5
-    - 10
-    ratio_delay_lag:
-    - 1
-    - 2
-    - 4

@@ -39,12 +39,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    vwap_sum_window:
-    - 5
-    - 10
-    - 20
-    ts_sum_vwap_divisor:
-    - 10

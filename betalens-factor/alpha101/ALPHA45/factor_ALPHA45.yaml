@@ -43,26 +43,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    close_delay_lag:
-    - 3
-    - 5
-    - 10
-    delay_close_sum_window:
-    - 10
-    - 20
-    - 40
-    ts_sum_delay_close_divisor:
-    - 20
-    close_volume_correlation_window:
-    - 1
-    - 2
-    - 4
-    close_sum_window:
-    - 5
-    close_sum_window_2:
-    - 20
-    ts_sum_close_ts_sum_close_correlation_window:
-    - 2

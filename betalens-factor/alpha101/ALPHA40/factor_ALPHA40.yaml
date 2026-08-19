@@ -38,14 +38,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    high_stddev_window:
-    - 5
-    - 10
-    - 20
-    high_volume_correlation_window:
-    - 5
-    - 10
-    - 20

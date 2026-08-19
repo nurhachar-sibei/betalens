@@ -49,10 +49,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    amount_average_window:
-    - 10
-    - 20
-    - 40

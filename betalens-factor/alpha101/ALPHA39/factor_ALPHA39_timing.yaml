@@ -53,24 +53,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    close_delta_lag:
-    - 4
-    - 7
-    - 14
-    rank_decay_linear_volume_complement_base:
-    - 1
-    amount_average_window:
-    - 10
-    - 20
-    - 40
-    volume_adv_decay_window:
-    - 5
-    - 9
-    - 18
-    rank_ts_sum_returns_offset:
-    - 1
-    returns_sum_window:
-    - 250

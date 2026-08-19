@@ -51,20 +51,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    close_rank_window:
-    - 5
-    - 10
-    - 20
-    close_delta_lag:
-    - 1
-    - 2
-    delta_close_delta_lag:
-    - 1
-    - 2
-    amount_average_window:
-    - 20
-    volume_adv_rank_window:
-    - 5

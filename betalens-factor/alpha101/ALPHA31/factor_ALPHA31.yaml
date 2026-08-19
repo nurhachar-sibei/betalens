@@ -42,22 +42,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    close_delta_lag:
-    - 5
-    - 10
-    - 20
-    rank_delta_close_decay_window:
-    - 5
-    - 10
-    - 20
-    close_delta_lag_2:
-    - 2
-    - 3
-    - 6
-    amount_average_window:
-    - 20
-    adv_low_correlation_window:
-    - 12

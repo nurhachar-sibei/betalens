@@ -6,6 +6,7 @@ import argparse
 import dataclasses
 import logging
 import sys
+import pandas as pd
 from pathlib import Path
 from typing import Mapping, Any
 
@@ -31,6 +32,7 @@ from factor_template_liqdemand import (  # noqa: E402
     clean_inf,
     get_pretom_dates,
 )
+from betalens.factor.mining import MiningSpec  # noqa: E402
 
 
 FactorPipeline = LiqDemandPipeline
@@ -68,58 +70,37 @@ def _require_param(params: Mapping[str, Any], key: str) -> Any:
 
 def make_mining_spec(params):
     window = int(_require_param(params, "window"))
-    return dataclasses.replace(
+    factor_spec = dataclasses.replace(
         spec,
         compute_kwargs={"window": window},
+        weight_mode="classic-long-short",
+    )
+    return MiningSpec(
+        factor_spec=factor_spec,
+        execution_mode="precomputed",
+        window_transform=_mining_window_transform if bool(_require_param(params, "pretom_only")) else None,
+        warmup_days=mining_warmup_days,
     )
 
 
-def mining_gid(params):
-    window = int(_require_param(params, "window"))
+def _mining_window_transform(weights, window, context):
+    params = context["params"]
+    if not bool(_require_param(params, "pretom_only")):
+        return weights
     pretom = _require_param(params, "pretom")
-    pretom_only = bool(_require_param(params, "pretom_only"))
-    n_quantiles = int(_require_param(params, "n_quantiles"))
-    timing = "PT" if pretom_only else "DLY"
-    return f"w{window}_p{int(pretom[0])}-{int(pretom[1])}_{timing}_q{n_quantiles}"
+    dates = get_pretom_dates(
+        window.start,
+        window.end,
+        lo=int(pretom[0]),
+        hi=int(pretom[1]),
+    )
+    keep = [pd.Timestamp(ts).date() in dates for ts in weights.index]
+    return weights.loc[keep]
 
 
 def mining_warmup_days(params):
     window = int(_require_param(params, "window"))
     return int(window * 1.5) + 60
-
-
-def mining_weight_hook(weights, task):
-    params = task["params"]
-    if not bool(_require_param(params, "pretom_only")):
-        return weights
-    pretom = _require_param(params, "pretom")
-    dates = get_pretom_dates(
-        task["win_start"],
-        task["win_end"],
-        lo=int(pretom[0]),
-        hi=int(pretom[1]),
-    )
-    keep = [ts.date() in dates for ts in weights.index]
-    return weights.loc[keep]
-
-
-def mining_valid_report(params, rank, output_dir, start_date, end_date):
-    mining_spec = dataclasses.replace(make_mining_spec(params), name=f"DISP_valid{rank}")
-    pretom = _require_param(params, "pretom")
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    LiqDemandPipeline(mining_spec).run(
-        start_date,
-        end_date,
-        warmup_days=mining_warmup_days(params),
-        pretom_only=bool(_require_param(params, "pretom_only")),
-        pretom_lo=int(pretom[0]),
-        pretom_hi=int(pretom[1]),
-        n_quantiles=int(_require_param(params, "n_quantiles")),
-        output_dir=output_dir,
-        include_profiling=False,
-        dump_excel=False,
-        verbose=False,
-    )
 
 
 def run_from_config(config_path: str | Path = _CONFIG_FILE):

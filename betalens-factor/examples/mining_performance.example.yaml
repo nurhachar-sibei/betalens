@@ -1,0 +1,22 @@
+runtime:
+  backend: process
+  workers: 4
+  chunk_size: 1
+  max_memory_ratio: 0.5
+
+cache:
+  enabled: true
+  directory: outputs/mining/_cache
+  rebuild: false
+  format: npy-memmap
+
+output:
+  directory: outputs/mining
+  window_results: parquet
+  summary_results: csv
+  persist_full_nav: selected_only
+
+logging:
+  level: INFO
+  task_logs: true
+  heartbeat_seconds: 30

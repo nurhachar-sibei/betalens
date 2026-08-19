@@ -46,26 +46,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    rank_close_high_decay_window:
-    - 4.03441
-    - 8.06882
-    - 16.13764
-    close_rank_window:
-    - 4.22364
-    - 8.44728
-    - 16.89456
-    amount_average_window:
-    - 30
-    - 60
-    - 120
-    adv_rank_window:
-    - 20.6966
-    ts_rank_close_ts_rank_adv_correlation_window:
-    - 8.01266
-    corr_decay_window:
-    - 6.65053
-    decay_linear_corr_rank_window:
-    - 2.61957

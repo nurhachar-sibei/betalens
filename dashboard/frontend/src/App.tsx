@@ -97,7 +97,6 @@ const EVENT_FALLBACK_PARAMS: Record<string, unknown> = {
   benchmark_code: '',
   metric: '收盘价(元)',
   table_name: 'daily_market',
-  mode: 'flexible',
   multi_asset_mode: 'aggregate',
   window_before: 20,
   window_after: 20,
@@ -176,7 +175,7 @@ const parseEventCodes = (value: unknown) => Array.from(new Set(
 ));
 
 // Keep asset colors stable across the two comparison charts so the legend is
-// easy to follow when a user scans from daily to cumulative returns.
+// easy to follow when a user scans the event-study results.
 const EVENT_ASSET_COLORS = [
   '#2d66a8',
   '#c45b4d',
@@ -229,12 +228,14 @@ const formatEventAssetLabel = (code: string, assets: EventStudyAsset[] | undefin
 };
 
 const formatEventStatsRows = (
-  rows: Array<Record<string, number | string | null>>,
+  rows: Array<Record<string, unknown>>,
   assets: EventStudyAsset[] | undefined
 ) => rows.map((row) => {
   const { code, ...stats } = row;
+  if ('mean' in stats) stats.mean = formatPercent(asNumber(stats.mean, Number.NaN));
+  if ('std' in stats) stats.std = formatPercent(asNumber(stats.std, Number.NaN));
   return {
-    '标的代码': formatEventAssetLabel(asString(code), assets),
+    ...(code !== undefined ? { '标的代码': formatEventAssetLabel(asString(code), assets) } : {}),
     ...stats
   };
 });
@@ -254,9 +255,9 @@ const formatEventSummaryRows = (
   'Day 0 平均收益': formatPercent(asNumber(row.day0Mean, Number.NaN)),
   'Day 0 t统计': formatEventStatistic(row.day0TStat),
   'Day 0 上涨概率': formatPercent(asNumber(row.day0PositiveProb, Number.NaN)),
-  [`Day ${row.finalDay ?? '-'} 累积收益`]: formatPercent(asNumber(row.finalMean, Number.NaN)),
-  '累积 t统计': formatEventStatistic(row.finalTStat),
-  '累积上涨概率': formatPercent(asNumber(row.finalPositiveProb, Number.NaN))
+  [`${row.holdingPeriod ?? '最长持有期'}平均收益`]: formatPercent(asNumber(row.holdingMean, Number.NaN)),
+  '持有收益 t统计': formatEventStatistic(row.holdingTStat),
+  '持有盈利概率': formatPercent(asNumber(row.holdingPositiveProb, Number.NaN))
 }));
 
 type PlotRangeBreak = { bounds?: [string, string]; values?: string[] };
@@ -1048,19 +1049,8 @@ function EventStudyPage({ onBack }: { onBack: () => void }) {
             <LabeledInput label="事件后窗口" type="number" value={asString(params.window_after)} onChange={(v) => update('window_after', Number(v))} />
             <LabeledInput label="持有起点偏移" type="number" value={asString(params.holding_start_offset)} onChange={(v) => update('holding_start_offset', Number(v))} />
             <LabeledInput label="收盘小时" type="number" value={asString(params.market_close_hour)} onChange={(v) => update('market_close_hour', Number(v))} />
-            <label className="field">
-              累积模式
-              <select value={asString(params.mode)} onChange={(event) => update('mode', event.target.value)}>
-                <option value="flexible">事件窗口</option>
-                <option value="fixed">固定持有期</option>
-              </select>
-            </label>
-            {params.mode === 'fixed' ? (
-              <>
-                <LabeledInput label="固定天数" value={asString(params.holding_days)} onChange={(v) => update('holding_days', v)} />
-                <LabeledInput label="固定月数" value={asString(params.holding_months)} onChange={(v) => update('holding_months', v)} />
-              </>
-            ) : null}
+            <LabeledInput label="持有天数" value={asString(params.holding_days)} onChange={(v) => update('holding_days', v)} />
+            <LabeledInput label="持有月数" value={asString(params.holding_months)} onChange={(v) => update('holding_months', v)} />
           </div>
         </aside>
 
@@ -1110,9 +1100,9 @@ function EventFilePreview({ file }: { file?: EventFile }) {
 
 function EventStudyResultView({ result }: { result: EventStudyResult }) {
   const daily = result.charts.dailyStats;
-  const cumulative = result.charts.cumulativeStats;
+  const holding = result.tables.holdingStats;
   const matrix = result.charts.returnsMatrix;
-  const cumulativeMatrix = result.charts.cumulativeReturnsMatrix || [];
+  const priceMatrix = result.charts.priceMatrix || [];
   const summary = result.summary;
   const codeLabel = (code: string) => formatEventAssetLabel(code, result.assets);
   const requestedCodes = useMemo(
@@ -1147,25 +1137,21 @@ function EventStudyResultView({ result }: { result: EventStudyResult }) {
     () => groupComparisonSeries(comparison?.dailyByCode, comparisonCodes),
     [comparison, comparisonCodes]
   );
-  const comparisonCumulativeSeries = useMemo(
-    () => groupComparisonSeries(comparison?.cumulativeByCode, comparisonCodes),
-    [comparison, comparisonCodes]
-  );
   const commonReferenceLabel = isComparison
     ? `共同均值（${validCodes.length || comparisonCodes.length} 个标的，参考）`
     : assetScopeLabel;
   const resultIdentityLabel = isComparison
     ? `同图比较（${validCodes.length || comparisonCodes.length} 个有效标的）`
     : assetScopeLabel;
-  const cumulativeEventSeries = useMemo(() => {
+  const priceEventSeries = useMemo(() => {
     const grouped = new Map<string, { label: string; rows: { day: number | string; value: number | null }[] }>();
-    cumulativeMatrix.forEach((row) => {
+    priceMatrix.forEach((row) => {
       const event = String(row.event ?? '');
       if (!event) return;
       const label = formatEventDateLabel(row.eventDate) || `事件 ${event}`;
-      const value = row.cumulativeReturn === null || row.cumulativeReturn === undefined
+      const value = row.relativePrice === null || row.relativePrice === undefined
         ? null
-        : Number(row.cumulativeReturn);
+        : Number(row.relativePrice);
       if (!grouped.has(event)) grouped.set(event, { label, rows: [] });
       grouped.get(event)!.rows.push({
         day: row.day as number | string,
@@ -1177,7 +1163,7 @@ function EventStudyResultView({ result }: { result: EventStudyResult }) {
       label: series.label,
       rows: series.rows.sort((a, b) => Number(a.day) - Number(b.day))
     }));
-  }, [cumulativeMatrix]);
+  }, [priceMatrix]);
 
   const dailyChartData = isComparison && comparison
     ? [
@@ -1227,74 +1213,6 @@ function EventStudyResultView({ result }: { result: EventStudyResult }) {
       }
     : eventLayout(`${assetScopeLabel}：事件窗口平均收益率`, 300);
 
-  const cumulativeChartData = isComparison && comparison
-    ? [
-        ...comparisonCumulativeSeries.map((series, index) => ({
-          x: series.rows.map((row) => row.day),
-          y: series.rows.map((row) => row.value),
-          type: 'scatter' as const,
-          mode: 'lines+markers' as const,
-          name: codeLabel(series.code),
-          line: { color: EVENT_ASSET_COLORS[index % EVENT_ASSET_COLORS.length], width: 2 },
-          marker: { size: 3 },
-          hovertemplate: `${codeLabel(series.code)}<br>Day %{x}<br>累积收益 %{y:.2%}<extra></extra>`
-        })),
-        ...(cumulative.length ? [{
-          x: cumulative.map((row) => row.day),
-          y: cumulative.map((row) => asNullableNumber(row.mean)),
-          type: 'scatter' as const,
-          mode: 'lines' as const,
-          name: commonReferenceLabel,
-          line: { color: '#182433', width: 2, dash: 'dot' as const },
-          opacity: 0.65,
-          visible: 'legendonly' as const,
-          hovertemplate: `${commonReferenceLabel}<br>Day %{x}<br>累积收益 %{y:.2%}<extra></extra>`
-        }] : [])
-      ]
-    : [
-        {
-          x: cumulative.map((row) => row.day),
-          y: cumulative.map((row) => row.mean),
-          type: 'scatter' as const,
-          mode: 'lines+markers' as const,
-          name: assetScopeLabel,
-          line: { color: '#2d66a8', width: 2 },
-          hovertemplate: `${assetScopeLabel}<br>Day %{x}<br>累积收益 %{y:.2%}<extra></extra>`
-        },
-        {
-          x: cumulative.map((row) => row.day),
-          y: cumulative.map((row) => asNumber(row.mean, 0) + asNumber(row.std, 0)),
-          type: 'scatter' as const,
-          mode: 'lines' as const,
-          name: '+1标准差',
-          line: { color: '#9eb7d6', width: 1, dash: 'dot' as const },
-          hoverinfo: 'skip' as const
-        },
-        {
-          x: cumulative.map((row) => row.day),
-          y: cumulative.map((row) => asNumber(row.mean, 0) - asNumber(row.std, 0)),
-          type: 'scatter' as const,
-          mode: 'lines' as const,
-          name: '-1标准差',
-          line: { color: '#9eb7d6', width: 1, dash: 'dot' as const },
-          hoverinfo: 'skip' as const
-        }
-      ];
-
-  const cumulativeChartLayout = isComparison
-    ? {
-        ...eventLayout('各标的平均累积收益率', 380),
-        margin: { l: 46, r: 22, t: 46, b: 88 },
-        legend: {
-          title: { text: '股票代码 / 中文名称' },
-          orientation: 'h' as const,
-          x: 0,
-          y: -0.2,
-          yanchor: 'top' as const
-        }
-      }
-    : eventLayout(`${assetScopeLabel}：平均累积收益率`, 320);
-
   return (
     <>
       <div className="event-result-heading">
@@ -1320,9 +1238,9 @@ function EventStudyResultView({ result }: { result: EventStudyResult }) {
           <MetricTile label="Day 0 平均收益" value={summary.day0Mean} percent />
           <MetricTile label="Day 0 t统计" value={summary.day0TStat} />
           <MetricTile label="Day 0 上涨概率" value={summary.day0PositiveProb} percent />
-          <MetricTile label={`Day ${summary.finalDay ?? '-'} 累积收益`} value={summary.finalMean} percent />
-          <MetricTile label="累积 t统计" value={summary.finalTStat} />
-          <MetricTile label="累积上涨概率" value={summary.finalPositiveProb} percent />
+          <MetricTile label={`${summary.holdingPeriod ?? '最长持有期'}平均收益`} value={summary.holdingMean} percent />
+          <MetricTile label="持有收益 t统计" value={summary.holdingTStat} />
+          <MetricTile label="持有盈利概率" value={summary.holdingPositiveProb} percent />
         </div>
       )}
       <div className="chart-card">
@@ -1334,27 +1252,18 @@ function EventStudyResultView({ result }: { result: EventStudyResult }) {
           />
         </Suspense>
       </div>
-      <div className="chart-card">
-        <Suspense fallback={<div className="chart-loading"><Loader2 className="spin" size={18} />加载图表...</div>}>
-          <PlotView
-            data={cumulativeChartData}
-            layout={cumulativeChartLayout}
-            config={{ displayModeBar: false, responsive: true }}
-          />
-        </Suspense>
-      </div>
       {result.comparison ? (
         <EventStudyComparisonView
           comparison={result.comparison}
-          commonEventMatrix={cumulativeMatrix}
+          commonEventMatrix={priceMatrix}
           assets={result.assets}
         />
       ) : null}
-      {!isComparison && cumulativeEventSeries.length ? (
+      {!isComparison && priceEventSeries.length ? (
         <div className="chart-card">
           <Suspense fallback={<div className="chart-loading"><Loader2 className="spin" size={18} />加载图表...</div>}>
             <PlotView
-              data={cumulativeEventSeries.map((series) => ({
+              data={priceEventSeries.map((series) => ({
                 x: series.rows.map((row) => row.day),
                 y: series.rows.map((row) => row.value),
                 type: 'scatter',
@@ -1362,11 +1271,11 @@ function EventStudyResultView({ result }: { result: EventStudyResult }) {
                 name: series.label,
                 line: { width: 1.4 },
                 opacity: 0.72,
-                hovertemplate: `${series.label}<br>Day %{x}<br>累积收益 %{y:.2%}<extra></extra>`
+                hovertemplate: `${series.label}<br>Day %{x}<br>相对价格 %{y:.2%}<extra></extra>`
               }))}
               layout={{
-                ...eventLayout(`${assetScopeLabel}：每次事件前后累积收益`, 360),
-                showlegend: cumulativeEventSeries.length <= 12
+                ...eventLayout(`${assetScopeLabel}：事件前后价格走势（Day 0 = 0）`, 360),
+                showlegend: priceEventSeries.length <= 12
               }}
               config={{ displayModeBar: false, responsive: true }}
             />
@@ -1409,16 +1318,16 @@ function EventStudyResultView({ result }: { result: EventStudyResult }) {
         <SimpleTable
           rows={isComparison && comparison
             ? formatEventStatsRows(comparison.dailyByCode, result.assets)
-            : result.tables.dailyStats}
+            : formatEventStatsRows(result.tables.dailyStats, result.assets)}
           maxHeight={360}
         />
       </div>
       <div className="table-page">
-        <div className="section-title"><Table2 size={18} />{isComparison ? '累积统计（逐标的）' : `累积统计（${assetScopeLabel}）`}</div>
+        <div className="section-title"><Table2 size={18} />{isComparison ? '持有收益（逐标的）' : `持有收益（${assetScopeLabel}）`}</div>
         <SimpleTable
           rows={isComparison && comparison
-            ? formatEventStatsRows(comparison.cumulativeByCode, result.assets)
-            : result.tables.cumulativeStats}
+            ? formatEventStatsRows(comparison.holdingByCode, result.assets)
+            : formatEventStatsRows(holding, result.assets)}
           maxHeight={360}
         />
       </div>
@@ -1452,7 +1361,7 @@ function EventStudyComparisonView({
   const selectedEventSeries = useMemo(() => {
     const grouped = new Map<string, Map<string, { day: number | string; value: number | null }>>();
     const days = new Map<string, number | string>();
-    comparison.eventCumulativeByCode
+    comparison.eventPriceByCode
       .filter((row) => String(row.eventId) === selectedEventId)
       .forEach((row) => {
         const code = asString(row.code);
@@ -1462,7 +1371,7 @@ function EventStudyComparisonView({
         if (!grouped.has(code)) grouped.set(code, new Map());
         grouped.get(code)!.set(dayKey, {
           day,
-          value: asNullableNumber(row.cumulativeReturn)
+          value: asNullableNumber(row.relativePrice)
         });
         days.set(dayKey, day);
       });
@@ -1479,13 +1388,13 @@ function EventStudyComparisonView({
         rows: orderedDays.map((day) => values?.get(String(day)) || { day, value: null })
       };
     });
-  }, [comparison.eventCumulativeByCode, comparison.validCodes, selectedEventId]);
+  }, [comparison.eventPriceByCode, comparison.validCodes, selectedEventId]);
 
   const commonEventRows = useMemo(() => commonEventMatrix
     .filter((row) => String(row.event) === selectedEventId)
     .map((row) => ({
       day: row.day as number | string,
-      value: asNullableNumber(row.cumulativeReturn)
+      value: asNullableNumber(row.relativePrice)
     }))
     .sort((a, b) => Number(a.day) - Number(b.day)), [commonEventMatrix, selectedEventId]);
 
@@ -1536,7 +1445,7 @@ function EventStudyComparisonView({
                   line: { width: 1.8 },
                   marker: { size: 4 },
                   connectgaps: false,
-                  hovertemplate: `${codeLabel(series.code)}<br>Day %{x}<br>累积收益 %{y:.2%}<extra></extra>`
+                  hovertemplate: `${codeLabel(series.code)}<br>Day %{x}<br>相对价格 %{y:.2%}<extra></extra>`
                 })),
                 ...(commonEventRows.length ? [{
                   x: commonEventRows.map((row) => row.day),
@@ -1547,11 +1456,11 @@ function EventStudyComparisonView({
                   line: { color: '#182433', width: 1.5, dash: 'dot' as const },
                   opacity: 0.55,
                   visible: 'legendonly' as const,
-                  hovertemplate: `${commonLabel}<br>Day %{x}<br>累积收益 %{y:.2%}<extra></extra>`
+                  hovertemplate: `${commonLabel}<br>Day %{x}<br>相对价格 %{y:.2%}<extra></extra>`
                 }] : [])
               ]}
               layout={{
-                ...eventLayout('单次事件累计收益', 400),
+                ...eventLayout('单次事件价格走势（Day 0 = 0）', 400),
                 margin: { l: 46, r: 22, t: 46, b: 88 },
                 legend: {
                   title: { text: '股票代码 / 中文名称' },

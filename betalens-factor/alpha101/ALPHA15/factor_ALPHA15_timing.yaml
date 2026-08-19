@@ -47,14 +47,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    rank_high_rank_volume_correlation_window:
-    - 2
-    - 3
-    - 6
-    rank_correlation_high_sum_window:
-    - 2
-    - 3
-    - 6

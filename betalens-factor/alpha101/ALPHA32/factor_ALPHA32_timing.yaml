@@ -49,20 +49,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    close_mean_window:
-    - 4
-    - 7
-    - 14
-    scale_correlation_vwap_coefficient:
-    - 20
-    close_delay_lag:
-    - 3
-    - 5
-    - 10
-    vwap_delay_close_correlation_window:
-    - 115
-    - 230
-    - 460

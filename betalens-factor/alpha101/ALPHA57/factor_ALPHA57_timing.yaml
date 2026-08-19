@@ -47,14 +47,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    close_argmax_window:
-    - 15
-    - 30
-    - 60
-    rank_ts_argmax_close_decay_window:
-    - 1
-    - 2
-    - 4

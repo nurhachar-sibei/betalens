@@ -10,7 +10,7 @@ EventStudy
 
    :param datafeed: :class:`betalens.datafeed.Datafeed` 实例，用于查询价格数据
 
-   .. py:method:: analyze(events, code, window_before=5, window_after=5, metric='收盘价(元)', periods=None, mode='flexible', holding_periods=None, holding_start_offset=0, market_close_hour=15, benchmark_code=None, multi_asset_mode='aggregate')
+   .. py:method:: analyze(events, code, window_before=5, window_after=5, metric='收盘价(元)', periods=None, holding_periods=None, holding_start_offset=0, market_close_hour=15, benchmark_code=None, multi_asset_mode='aggregate', exchange='SHSE')
 
       分析事件前后的收益率表现。
 
@@ -20,19 +20,21 @@ EventStudy
       :param window_after: 事件后窗口期数
       :param metric: 价格指标名称，如 ``'收盘价(元)'``
       :param periods: 可选的时间分段序列（pd.Series），用于分组统计
-      :param mode: ``'flexible'`` 连续累积 | ``'fixed'`` 固定持有期
-      :param holding_periods: mode='fixed' 时的持有期字典，如 ``{'days': [1,2,3,4,5], 'months': [1,3,6,9,12]}``
+      :param holding_periods: 持有期字典，如 ``{'days': [1,2,3,4,5], 'months': [1,3,6,9,12]}``；不传时使用该默认值
       :param holding_start_offset: 持有起点偏移天数（0=Day 0, -3=提前3天）
       :param market_close_hour: 市场收盘时间（小时），默认 15
       :param benchmark_code: 基准代码，提供时计算超额收益 = 标的收益 - 基准收益
       :param multi_asset_mode: 多标的处理方式；``'aggregate'`` 保持等权聚合，``'compare'`` 同时返回逐标的比较结果
+      :param exchange: 标准交易日历交易所代码，默认 ``'SHSE'``
       :return: 结果字典，包含以下键：
 
          - ``daily_stats`` (pd.DataFrame): 每日收益统计，index=day，列含 mean, std, positive_prob, odds, t_stat, count
-         - ``cumulative_stats`` (pd.DataFrame): 累积收益统计，同上结构
+         - ``holding_stats`` (pd.DataFrame): 固定持有收益统计，含持有期、均值、标准差、盈利概率、t 统计和样本数
          - ``event_count`` (int): 有效事件数
          - ``returns_matrix`` (pd.DataFrame): 收益矩阵，行=相对天数，列=事件编号
-         - ``cumulative_returns_matrix`` (pd.DataFrame): 累积收益矩阵，行=相对天数，列=事件编号
+         - ``trade_days`` (pd.DatetimeIndex): 本次分析实际使用的标准交易日序列
+         - ``holding_returns_matrix`` (pd.DataFrame): 每次事件的固定持有收益矩阵
+         - ``price_matrix`` (pd.DataFrame): 每次事件的价格曲线，Day 0 归一化为 0
          - ``stock_returns_dict`` (dict, 多标的模式): {代码: 收益矩阵}
          - ``valid_codes`` (list, 多标的模式): 有效代码列表
          - ``skipped_codes`` (list, 多标的模式): 无有效窗口的代码及原因
@@ -42,8 +44,9 @@ EventStudy
 
       .. note::
 
-         Day 0 成本价规则：事件在 15:00 前 → 当天收盘价；15:00 后 → 次日收盘价。
-         compare 模式至少需要两个代码；多标的共性结果先在同一事件/相对日内对可用标的等权平均，再使用既有累计算法。
+         ``daily_stats`` 使用每个交易日自身的收盘价涨跌幅。事件在 15:00 前以当日为 Day 0，15:00 后以下一标准交易日为 Day 0。
+         相对日由 ``get_absolute_trade_days(..., "D")`` 提供的标准交易日序列确定。
+         compare 模式至少需要两个代码；多标的共性结果在同一事件和相对日内对可用标的等权平均。
 
    .. py:method:: plot_bar(daily_stats, title='事件前后平均收益率', figsize=(12, 6), save_path=None)
 
@@ -54,19 +57,9 @@ EventStudy
       :param figsize: 图表尺寸
       :param save_path: 保存路径（None 则直接显示）
 
-   .. py:method:: plot_lines(cumulative_stats, title='事件前后平均累积收益率', figsize=(12, 6), save_path=None, show_std=True)
+   .. py:method:: plot_multi_stocks(events, codes, event_index=0, window_before=10, window_after=10, metric='收盘价(元)', market_close_hour=15, title=None, figsize=(14, 8), save_path=None, exchange='SHSE')
 
-      折线图展示累积收益曲线，支持单标的和多标的对比。
-
-      :param cumulative_stats: pd.DataFrame（单标的）或 dict（多标的，``{代码: cumulative_stats_df}``）
-      :param title: 图表标题
-      :param figsize: 图表尺寸
-      :param save_path: 保存路径（None 则直接显示）
-      :param show_std: 是否显示 ±1 标准差区间（仅单标的模式）
-
-   .. py:method:: plot_multi_stocks(events, codes, event_index=0, window_before=10, window_after=10, metric='收盘价(元)', market_close_hour=15, title=None, figsize=(14, 8), save_path=None)
-
-      折线图展示多只股票在同一个事件前后的累积收益曲线。所有折线在 t=0, y=0 处相交。
+      折线图展示多只股票在同一个事件前后的价格走势，各曲线在 Day 0 对齐为 0。
 
       :param events: 事件序列
       :param codes: 股票代码列表
@@ -78,10 +71,11 @@ EventStudy
       :param title: 标题（None 自动生成）
       :param figsize: 图表尺寸
       :param save_path: 保存路径
+      :param exchange: 标准交易日历交易所代码，默认 ``'SHSE'``
 
-   .. py:method:: plot_events_lines(events, code, window_before=10, window_after=10, metric='收盘价(元)', market_close_hour=15, title=None, figsize=(14, 8), max_events=None, save_path=None)
+   .. py:method:: plot_events_lines(events, code, window_before=10, window_after=10, metric='收盘价(元)', market_close_hour=15, title=None, figsize=(14, 8), max_events=None, save_path=None, exchange='SHSE')
 
-      折线图展示同一标的在多个事件前后的累积收益曲线。所有折线在 t=0, y=0 处相交。
+      折线图叠加同一标的在多个事件前后的价格走势，各曲线在 Day 0 对齐为 0。
 
       :param events: 事件序列
       :param code: 股票代码
@@ -93,6 +87,7 @@ EventStudy
       :param figsize: 图表尺寸
       :param max_events: 最多展示事件数（None 全部展示）
       :param save_path: 保存路径
+      :param exchange: 标准交易日历交易所代码，默认 ``'SHSE'``
 
 辅助函数
 ~~~~~~~~

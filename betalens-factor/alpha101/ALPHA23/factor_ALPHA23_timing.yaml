@@ -47,16 +47,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    high_mean_window:
-    - 10
-    - 20
-    - 40
-    high_delta_lag:
-    - 1
-    - 2
-    - 4
-    high_ts_mean_false_value:
-    - 0.0

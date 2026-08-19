@@ -150,8 +150,8 @@ export type EventStudyComparison = {
   truncated: boolean;
   summaryByCode: Array<Record<string, number | string | null>>;
   dailyByCode: Array<Record<string, number | string | null>>;
-  cumulativeByCode: Array<Record<string, number | string | null>>;
-  eventCumulativeByCode: Array<Record<string, number | string | null>>;
+  holdingByCode: Array<Record<string, number | string | null>>;
+  eventPriceByCode: Array<Record<string, number | string | null>>;
 };
 
 export type EventStudyAsset = {
@@ -171,13 +171,13 @@ export type EventStudyResult = {
   summary: Record<string, number | string | string[] | null>;
   charts: {
     dailyStats: Array<Record<string, number | string | null>>;
-    cumulativeStats: Array<Record<string, number | string | null>>;
+    holdingStats: Array<Record<string, number | string | null>>;
     returnsMatrix: Array<Record<string, number | string | null>>;
-    cumulativeReturnsMatrix: Array<Record<string, number | string | null>>;
+    priceMatrix: Array<Record<string, number | string | null>>;
   };
   tables: {
     dailyStats: Array<Record<string, unknown>>;
-    cumulativeStats: Array<Record<string, unknown>>;
+    holdingStats: Array<Record<string, unknown>>;
     events: Array<Record<string, unknown>>;
   };
   comparison?: EventStudyComparison;

@@ -44,26 +44,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    open_mix_weight:
-    - 0.004086025
-    - 0.00817205
-    - 0.012258075
-    mixed_complement_base:
-    - 1
-    mixed_complement_weight:
-    - 0.004086025
-    - 0.00817205
-    - 0.012258075
-    amount_average_window:
-    - 30
-    - 60
-    - 120
-    adv_sum_window:
-    - 8.6911
-    mixed_ts_sum_adv_correlation_window:
-    - 6.40374
-    open_minimum_window:
-    - 13.635

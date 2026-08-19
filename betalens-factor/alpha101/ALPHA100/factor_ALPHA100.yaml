@@ -45,22 +45,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    amount_average_window:
-    - 10
-    - 20
-    - 40
-    close_rank_adv_correlation_window:
-    - 3
-    - 5
-    - 10
-    close_argmin_window:
-    - 15
-    - 30
-    - 60
-    scale_first_coefficient:
-    - 1.5
-    amount_average_window_2:
-    - 20

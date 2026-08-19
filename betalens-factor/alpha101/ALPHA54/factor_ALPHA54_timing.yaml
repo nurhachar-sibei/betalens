@@ -49,14 +49,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    open_power_exponent:
-    - 2.5
-    - 5.0
-    - 10.0
-    close_power_exponent:
-    - 2.5
-    - 5.0
-    - 10.0

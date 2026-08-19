@@ -9,6 +9,10 @@
 ``EventStudy`` 接收一个 ``Datafeed`` 实例，通过 ``query_time_range()`` 获取价格数据，
 然后围绕事件日期计算窗口期收益率，并提供统计分析和可视化功能。
 
+事件窗口统一使用 ``get_absolute_trade_days(..., "D")`` 返回的标准交易日历。
+因此相对日 ``-n ... n`` 始终表示交易日，而不是自然日；行情缺失会保留为空值，
+不会把后一个交易日错误地前移。
+
 **核心流程：**
 
 1. 准备事件序列（Series，index 为 datetime，值 1 表示事件发生）
@@ -49,39 +53,26 @@
 ``analyze()`` 返回一个字典，包含：
 
 - ``daily_stats``: 每日收益统计（均值、标准差、上涨概率、t 统计量等）
-- ``cumulative_stats``: 累积收益统计
+- ``holding_stats``: 固定持有收益统计
 - ``event_count``: 有效事件数
 - ``returns_matrix``: 完整收益矩阵（行=相对天数，列=事件编号）
-- ``cumulative_returns_matrix``: 每次事件的累积收益矩阵（行=相对天数，列=事件编号）
+- ``holding_returns_matrix``: 每次事件的固定持有收益矩阵
+- ``price_matrix``: 每次事件的价格曲线（Day 0 归一化为 0）
 
-Day 0 成本价规则
-~~~~~~~~~~~~~~~~
+``daily_stats`` 使用各交易日自身的收盘价涨跌幅。Day 0 不再表示从成本价开始的
+下一段收益，而是 Day 0 交易日当日的涨跌幅。
 
-- 事件在 15:00 前发生 → 当天收盘价为 Day 0 成本价
-- 事件在 15:00 后发生 → 第二个交易日收盘价为 Day 0 成本价
+Day 0 日期规则
+~~~~~~~~~~~~~~
 
-分析模式
+- 事件在 15:00 前发生 → 当天为 Day 0
+- 事件在 15:00 后发生 → 下一标准交易日为 Day 0
+
+持有收益
 --------
 
-flexible 模式（默认）
-~~~~~~~~~~~~~~~~~~~~~
-
-以 ``holding_start_offset`` 指定的持有起点为分界点计算双向累积收益，适合观察事件前后的整体走势：
-
-.. code-block:: python
-
-   result = es.analyze(
-       events=events,
-       code='868008.WI',
-       window_before=20,
-       window_after=20,
-       mode='flexible'
-   )
-
-fixed 模式
-~~~~~~~~~~
-
-计算固定持有期的累积收益，适合精确衡量持有 N 天/月的回报：
+``analyze()`` 始终计算固定持有期收益，不需要指定模式。默认计算持有 1 至 5 日，
+以及 1、3、6、9、12 个月（每月按 21 个交易日）的收益：
 
 .. code-block:: python
 
@@ -90,7 +81,6 @@ fixed 模式
        code='868008.WI',
        window_before=20,
        window_after=60,
-       mode='fixed',
        holding_periods={'days': [1, 2, 3, 4, 5], 'months': [1, 3, 6]}
    )
 
@@ -161,14 +151,14 @@ fixed 模式
        multi_asset_mode='compare'
    )
 
-   common_stats = result['cumulative_stats']
+   common_stats = result['holding_stats']
    by_code = result['comparison']['by_code']
-   hs300_stats = by_code['000300.SH']['cumulative_stats']
+   hs300_stats = by_code['000300.SH']['holding_stats']
 
 比较模式的口径如下：
 
-- 顶层 ``daily_stats``、``cumulative_stats`` 和矩阵仍代表共性结果。
-- 共性先在相同 ``event_id`` 和相对日上对可用标的等权平均，再沿用 flexible/fixed 累计算法。
+- 顶层 ``daily_stats``、``holding_stats`` 和矩阵仍代表共性结果。
+- 共性先在相同 ``event_id`` 和相对日上对可用标的等权平均，再计算固定持有收益。
 - ``comparison['by_code']`` 提供每个代码的事件数、覆盖率、日度/累计统计和事件矩阵。
 - 每个输入事件都有稳定 ``event_id``；某标的缺少某次事件行情时保留空值，不会让后续事件错位。
 - 提供 ``benchmark_code`` 时，每个标的先计算相对同一基准的超额收益，再进行聚合与比较。
@@ -188,21 +178,6 @@ Dashboard 的“多标的处理”参数可选择“等权聚合”或“同图�
        result['daily_stats'],
        title='事件前后平均收益率',
        save_path='bar_chart.png'   # 不传则直接显示
-   )
-
-折线图：累积收益曲线
-~~~~~~~~~~~~~~~~~~~~~
-
-.. code-block:: python
-
-   # 单标的
-   es.plot_lines(result['cumulative_stats'], title='累积收益')
-
-   # 多标的对比：传入 {代码: cumulative_stats} 字典
-   es.plot_lines(
-       {'000905.SH': result1['cumulative_stats'],
-        '000300.SH': result2['cumulative_stats']},
-       title='多标的累积收益对比'
    )
 
 多股票单事件对比
@@ -235,6 +210,9 @@ Dashboard 的“多标的处理”参数可选择“等权聚合”或“同图�
        save_path='events_lines.png'
    )
 
+``plot_multi_stocks`` 和 ``plot_events_lines`` 会复用 ``analyze()`` 的 ``price_matrix``，
+仅比较事件前后的价格形态。所有曲线在 Day 0 对齐为 0，纵轴表示相对价格变化。
+
 完整示例
 --------
 
@@ -263,10 +241,10 @@ Dashboard 的“多标的处理”参数可选择“等权聚合”或“同图�
    # 4. 查看统计
    print(f"事件数: {result['event_count']}")
    print(result['daily_stats'])
-   print(result['cumulative_stats'])
+   print(result['holding_stats'])
 
    # 5. 可视化
    es.plot_bar(result['daily_stats'], title='日收益', save_path='bar.png')
-   es.plot_lines(result['cumulative_stats'], title='累积收益', save_path='line.png')
+   es.plot_events_lines(events, '868008.WI', save_path='event_prices.png')
 
    df.close()

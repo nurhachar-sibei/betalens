@@ -38,14 +38,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    rank_volume_rank_vwap_correlation_window:
-    - 3
-    - 5
-    - 10
-    rank_correlation_volume_maximum_window:
-    - 3
-    - 5
-    - 10

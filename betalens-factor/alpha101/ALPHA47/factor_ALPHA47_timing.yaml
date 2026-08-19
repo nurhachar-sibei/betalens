@@ -52,20 +52,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    close_divisor:
-    - 1
-    amount_average_window:
-    - 10
-    - 20
-    - 40
-    high_mean_window:
-    - 3
-    - 5
-    - 10
-    vwap_delay_lag:
-    - 3
-    - 5
-    - 10

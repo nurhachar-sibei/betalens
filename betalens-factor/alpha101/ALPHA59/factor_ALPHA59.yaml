@@ -43,24 +43,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    vwap_mix_weight:
-    - 0.3641585
-    - 0.728317
-    - 1.0
-    mixed_complement_base:
-    - 1
-    mixed_complement_weight:
-    - 0.3641585
-    - 0.728317
-    - 1.0
-    indneutralize_mixed_industry_volume_correlation_window:
-    - 2.125985
-    - 4.25197
-    - 8.50394
-    value_decay_window:
-    - 16.2289
-    decay_linear_value_rank_window:
-    - 8.19648

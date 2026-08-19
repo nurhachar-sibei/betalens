@@ -50,22 +50,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    close_delay_lag:
-    - 4
-    - 7
-    - 14
-    close_delta_lag:
-    - 4
-    - 7
-    - 14
-    rank_ts_sum_returns_offset:
-    - 1
-    ts_sum_returns_offset:
-    - 1
-    returns_sum_window:
-    - 125
-    - 250
-    - 500

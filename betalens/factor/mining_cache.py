@@ -3,16 +3,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import socket
 import shutil
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
 import pandas as pd
+
+
+_LOGGER = logging.getLogger("betalens.factor.mining")
 
 
 def _json_write(path: Path, payload: Mapping[str, Any]) -> None:
@@ -401,4 +406,112 @@ def estimated_resident_bytes(path: str | Path) -> int:
     return min(total, 768 * 1024 * 1024)
 
 
-__all__ = ["estimated_resident_bytes", "frame", "open_manifest", "publish"]
+@dataclass(frozen=True)
+class CacheRequest:
+    """Description of an immutable mining data generation."""
+
+    directory: str | Path
+    signature: str
+    rebuild: bool = False
+
+
+class MiningCache:
+    """Small public facade over the immutable memmap-v3 cache.
+
+    The mining runner only needs ``open_or_build`` and ``load``.  The existing
+    low-level ``publish``/``open_manifest`` functions remain available for the
+    builder used by the data provider, but cache policy no longer leaks into
+    the scheduler or worker code.
+    """
+
+    def __init__(self, manifest_path: str | Path):
+        self.manifest_path = Path(manifest_path).resolve()
+        self.manifest = open_manifest(self.manifest_path)
+
+    @classmethod
+    def open_or_build(cls, request: CacheRequest, builder=None) -> "MiningCache":
+        started = time.perf_counter()
+        directory = Path(request.directory).resolve()
+        directory.mkdir(parents=True, exist_ok=True)
+        ready = directory / "READY.json"
+        damaged = False
+        signature_short = request.signature[:12]
+        _LOGGER.info(
+            "开始检查共享缓存：目录=%s，签名=%s，强制重建=%s",
+            directory,
+            signature_short,
+            "是" if request.rebuild else "否",
+        )
+        if ready.exists() and not request.rebuild:
+            try:
+                pointer = json.loads(ready.read_text(encoding="utf-8"))
+                manifest = directory / str(pointer["manifest"])
+                payload = json.loads(manifest.read_text(encoding="utf-8"))
+                if payload.get("cache_signature") == request.signature:
+                    _LOGGER.info(
+                        "共享缓存命中：签名=%s，清单=%s，耗时=%.1f秒",
+                        signature_short,
+                        manifest,
+                        time.perf_counter() - started,
+                    )
+                    return cls(manifest)
+                _LOGGER.info(
+                    "共享缓存未命中：原因=数据签名已变化，请求签名=%s，现有签名=%s",
+                    signature_short,
+                    str(payload.get("cache_signature", ""))[:12],
+                )
+            except (OSError, ValueError, KeyError, TypeError):
+                damaged = True
+                _LOGGER.warning("共享缓存清单损坏，将重新构建：就绪文件=%s", ready, exc_info=True)
+        elif request.rebuild:
+            _LOGGER.info("共享缓存未命中：原因=配置要求强制重建，签名=%s", signature_short)
+        else:
+            _LOGGER.info("共享缓存未命中：原因=尚未建立缓存，签名=%s", signature_short)
+        if builder is None:
+            raise FileNotFoundError(
+                f"mining cache generation {request.signature} is missing; provide a builder"
+            )
+        _LOGGER.info("开始构建共享缓存：签名=%s", signature_short)
+        payload = builder()
+        _LOGGER.info("开始原子发布共享缓存：签名=%s", signature_short)
+        manifest = publish(
+            directory,
+            request.signature,
+            rebuild=request.rebuild or damaged,
+            **payload,
+        )
+        _LOGGER.info(
+            "共享缓存构建完成：签名=%s，清单=%s，总耗时=%.1f秒",
+            signature_short,
+            manifest,
+            time.perf_counter() - started,
+        )
+        return cls(manifest)
+
+    @property
+    def universe(self) -> list[str]:
+        return list(self.manifest.get("universe") or [])
+
+    def load(self, name: str, start=None, end=None, columns=None) -> pd.DataFrame:
+        groups = {
+            **self.manifest.get("inputs", {}),
+            **self.manifest.get("industry_by_scheme", {}),
+            "price": self.manifest.get("price"),
+            "execution_price": self.manifest.get("execution_price"),
+            "trade_status": self.manifest.get("trade_status"),
+            "pit": self.manifest.get("pit"),
+        }
+        descriptor = groups.get(name)
+        if descriptor is None:
+            raise KeyError(f"unknown mining cache dataset: {name}")
+        return frame(descriptor, start=start, end=end, columns=columns)
+
+
+__all__ = [
+    "CacheRequest",
+    "MiningCache",
+    "estimated_resident_bytes",
+    "frame",
+    "open_manifest",
+    "publish",
+]

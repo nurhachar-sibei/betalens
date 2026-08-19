@@ -47,10 +47,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    open_close_coefficient:
-    - -1
-    open_close_complement_base:
-    - 1

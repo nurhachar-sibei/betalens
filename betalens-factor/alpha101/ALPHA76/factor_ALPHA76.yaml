@@ -45,26 +45,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    vwap_delta_lag:
-    - 1.0
-    - 1.24383
-    - 2.48766
-    delta_vwap_decay_window:
-    - 5.91295
-    - 11.8259
-    - 23.6518
-    amount_average_window:
-    - 41
-    - 81
-    - 162
-    indneutralize_low_sector_adv_correlation_window:
-    - 8.14941
-    corr_rank_window:
-    - 19.569
-    ts_rank_corr_decay_window:
-    - 17.1543
-    decay_linear_ts_rank_corr_rank_window:
-    - 19.383

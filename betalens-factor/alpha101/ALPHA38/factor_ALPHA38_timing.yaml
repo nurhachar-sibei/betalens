@@ -46,10 +46,3 @@ run:
   dump_excel: true
   warmup_days: null
   output_dir: outputs/runs/manual
-mining:
-  sampler: grid
-  search_space:
-    close_rank_window:
-    - 5
-    - 10
-    - 20
