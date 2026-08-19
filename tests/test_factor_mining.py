@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import sqlite3
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,7 +34,7 @@ def test_optuna_search_supports_log_and_composite_categories():
     assert 10 <= params["window"] <= 80
     assert params["pair"] in [[9, 4], [7, 4]]
 
-    candidates = generate_fine_candidates(
+    plan = generate_fine_candidates(
         specs,
         [{"window": 20, "pair": [9, 4]}],
         {"points_per_dimension": 3, "max_candidates": 6},
@@ -44,8 +45,11 @@ def test_optuna_search_supports_log_and_composite_categories():
             {"window": 80, "pair": [7, 4]},
         ],
     )
+    candidates = plan.candidates
     assert len(candidates) <= 6
     assert all(10 <= row["window"] <= 40 for row in candidates)
+    assert plan.local_bounds["window"]["local_low"] == 10
+    assert plan.local_bounds["window"]["local_high"] == 40
 
     grid = create_fine_grid_study({"window": [20, 40], "pair": [[9, 4], [7, 4]]})
     categorical_specs = {
@@ -89,24 +93,9 @@ def test_cache_open_or_build_and_slice(tmp_path):
         check_freq=False,
     )
     assert second.universe == ["A"]
-    (tmp_path / "READY.json").write_text("not-json", encoding="utf-8")
-    rebuilt = MiningCache.open_or_build(request, builder)
-    assert calls == 2
-    assert rebuilt.load("price").shape == values.shape
-
-
-def test_selected_nav_publication_keeps_only_selected_candidate(tmp_path):
-    staging = tmp_path / ".nav_staging" / "run-id"
-    index = pd.date_range("2024-01-01", periods=3, freq="D")
-    nav = pd.Series([1.0, 1.1, 1.2], index=index)
-    mining._persist_nav(nav, "selected", "full", {"_nav_staging": str(staging)})
-    mining._persist_nav(nav, "filtered", "full", {"_nav_staging": str(staging)})
-    published = mining._publish_selected_nav(staging, tmp_path, {"selected"})
-    assert published is not None
-    assert (published / "selected" / "full.npy").exists()
-    assert not (published / "filtered").exists()
-    payload = np.load(published / "selected" / "full.npy", allow_pickle=False)
-    assert payload["nav"].tolist() == [1.0, 1.1, 1.2]
+    assert (tmp_path / "input_manifest.json").exists()
+    assert (tmp_path / "datasets").is_dir()
+    assert not (tmp_path / "READY.json").exists()
 
 
 def _synthetic_data() -> mining.MiningData:
@@ -192,6 +181,56 @@ def test_execution_modes_compute_once_and_isolate_windows(monkeypatch):
     assert len(factory_calls) == 1 + len(windows)
     assert len({id(value) for value in factory_calls}) == len(factory_calls)
     assert calls["nav"] == 2
+    assert all(row["error"] is None for row in rows)
+
+
+def test_precomputed_window_transform_reuses_factor_and_retests_each_window(monkeypatch):
+    data = _synthetic_data()
+    windows = [
+        mining.MiningWindow("4/4/0", "2024-01-05", "2024-01-08", 4, 4),
+        mining.MiningWindow("4/4/1", "2024-01-09", "2024-01-12", 4, 4),
+    ]
+    calls = {"compute": 0, "transform": 0, "nav": 0}
+
+    class Factor:
+        name = "transform"
+        compute_kwargs = {}
+        weight_mode = "classic-long-short"
+
+        def compute(self, **kwargs):
+            calls["compute"] += 1
+            return kwargs["x"]
+
+    def transform(weights, window, context):
+        calls["transform"] += 1
+        return weights
+
+    module = types.ModuleType("_mining_transform_test")
+    module.make_mining_spec = lambda params: mining.MiningSpec(
+        Factor(), window_transform=transform,
+    )
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setattr(
+        mining,
+        "_build_weights",
+        lambda *args, **kwargs: pd.DataFrame({"A": 1.0}, index=data.price.index),
+    )
+
+    def vector_nav(weights, price):
+        calls["nav"] += 1
+        return pd.Series(range(1, len(price) + 1), index=price.index, dtype=float)
+
+    monkeypatch.setattr(mining, "_vector_nav", vector_nav)
+    rows = mining._evaluate_candidate(
+        module.__name__,
+        "TRANSFORM",
+        {"p": 1},
+        "coarse",
+        windows,
+        data,
+        {"span": ["2024-01-01", "2024-01-15"], "engine": "vector", "rebal_freq": "D"},
+    )
+    assert calls == {"compute": 1, "transform": 2, "nav": 2}
     assert all(row["error"] is None for row in rows)
 
 
@@ -332,11 +371,9 @@ def test_run_logging_is_live_and_persisted(tmp_path, monkeypatch, capsys):
         yaml.safe_dump(
             {
                 "runtime": {"backend": "serial", "workers": 1},
-                "cache": {"enabled": False, "format": "npy-memmap"},
+                "cache": {"data_enabled": False},
                 "output": {
                     "directory": str(output_dir),
-                    "window_results": "csv",
-                    "persist_full_nav": "none",
                 },
                 "logging": {"level": "INFO", "task_logs": True, "heartbeat_seconds": 0},
             },
@@ -347,32 +384,120 @@ def test_run_logging_is_live_and_persisted(tmp_path, monkeypatch, capsys):
 
     result = mining.run_mining(parameter_path, performance_path)
     terminal = capsys.readouterr().out
-    assert result.output_dir == output_dir
+    assert len(result.factor_runs) == 1
+    factor_run = result.factor_runs[0]
+    assert factor_run.run_dir.parent == output_dir / "LOG_TEST"
     for marker in (
         "开始参数挖掘",
-        "开始处理第1/1个因子",
+        "开始处理因子",
         "粗搜候选已生成",
         "开始评价第1/",
         "粗搜进度",
         "细搜筛选完成",
-        "结果文件已写入",
-        "参数挖掘完成",
+        "因子挖掘完成",
     ):
         assert marker in terminal
     assert "信息 [主进程 PID=" in terminal
     assert "窗口方案=4日窗口、每4日滑动、第1个窗口" in terminal
-    manifest = yaml.safe_load((output_dir / "run_manifest.json").read_text(encoding="utf-8"))
-    assert manifest["status"] == "complete"
-    audit = Path(manifest["audit_log"])
+    metadata = yaml.safe_load((factor_run.run_dir / "metadata.yaml").read_text(encoding="utf-8"))
+    assert metadata["status"] == "complete"
+    assert metadata["launch_id"] == result.launch_id
+    audit = factor_run.run_dir / "audit" / "运行日志.log"
     assert audit.exists()
     audit_text = audit.read_text(encoding="utf-8")
     assert "开始参数挖掘" in audit_text
     assert "完成第1/" in audit_text
-    assert "参数挖掘完成" in audit_text
+    assert "因子挖掘完成" in audit_text
+    assert (factor_run.run_dir / "audit" / "挖掘审计.xlsx").exists()
+    result_db = factor_run.run_dir / "cache" / "results.sqlite3"
+    assert result_db.exists()
+    with sqlite3.connect(result_db) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM window_results").fetchone()[0] == 4
+        assert connection.execute("SELECT COUNT(*) FROM candidate_summary").fetchone()[0] == 2
+        assert connection.execute("SELECT COUNT(*) FROM winners").fetchone()[0] == 1
+    workbook = pd.ExcelFile(factor_run.run_dir / "audit" / "挖掘审计.xlsx")
+    assert {
+        "运行概览", "运行配置", "参数空间", "搜索进度", "窗口表现",
+        "候选汇总", "赢家参数", "赢家汇总", "错误",
+    }.issubset(workbook.sheet_names)
+    assert not (output_dir / "run_manifest.json").exists()
     assert not any(
         getattr(handler, "_betalens_mining_handler", False)
         for handler in mining._LOGGER.handlers
     )
+    second = mining.run_mining(parameter_path, performance_path).factor_runs[0]
+    assert second.run_dir != factor_run.run_dir
+    assert second.run_dir.parent == factor_run.run_dir.parent
+
+
+def test_multi_factor_launch_creates_isolated_task_directories(tmp_path, monkeypatch):
+    parameter_path = tmp_path / "parameter_space.yaml"
+    performance_path = tmp_path / "performance.yaml"
+    output_dir = tmp_path / "output"
+    parameter_path.write_text(
+        yaml.safe_dump({
+            "version": 1,
+            "factor_class": "test",
+            "factors": {
+                "F1": {"module": "unused", "execution_mode": "precomputed", "parameters": {}},
+                "F2": {"module": "unused", "execution_mode": "precomputed", "parameters": {}},
+            },
+            "evaluation": {"span": ["2024-01-01", "2024-01-15"]},
+            "windows": {"lengths": [4], "steps": [4]},
+        }, sort_keys=False),
+        encoding="utf-8",
+    )
+    performance_path.write_text(
+        yaml.safe_dump({
+            "runtime": {"backend": "serial", "workers": 1},
+            "cache": {"data_enabled": False},
+            "output": {"directory": str(output_dir)},
+            "logging": {"level": "INFO", "task_logs": False, "heartbeat_seconds": 0},
+        }, sort_keys=False),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        mining,
+        "_windows",
+        lambda *args, **kwargs: [mining.MiningWindow("4/4/0", "2024-01-01", "2024-01-04", 4, 4)],
+    )
+
+    def fake_run_factor(task, factor_id, *args, **kwargs):
+        return mining.FactorMiningResult(
+            factor_id=factor_id,
+            run_id=task.run_id,
+            run_dir=task.run_dir,
+            status="complete",
+        )
+
+    monkeypatch.setattr(mining, "_run_factor", fake_run_factor)
+    result = mining.run_mining(parameter_path, performance_path)
+    assert [run.factor_id for run in result.factor_runs] == ["F1", "F2"]
+    assert len({run.run_dir for run in result.factor_runs}) == 2
+    for run in result.factor_runs:
+        metadata = yaml.safe_load((run.run_dir / "metadata.yaml").read_text(encoding="utf-8"))
+        assert metadata["launch_id"] == result.launch_id
+        assert run.run_dir.parent == output_dir / run.factor_id
+
+
+def test_legacy_performance_options_are_rejected(tmp_path):
+    parameter_path = tmp_path / "parameter_space.yaml"
+    performance_path = tmp_path / "performance.yaml"
+    parameter_path.write_text(
+        yaml.safe_dump({
+            "version": 1,
+            "factors": {"F": {"module": "unused", "execution_mode": "precomputed", "parameters": {}}},
+            "evaluation": {"span": ["2024-01-01", "2024-01-15"]},
+            "windows": {"lengths": [4], "steps": [4]},
+        }),
+        encoding="utf-8",
+    )
+    performance_path.write_text(
+        yaml.safe_dump({"cache": {"enabled": True}, "output": {"directory": str(tmp_path)}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="cache.enabled"):
+        mining.run_mining(parameter_path, performance_path)
 
 
 def test_failed_run_updates_manifest_and_audit_log(tmp_path):
@@ -402,8 +527,8 @@ def test_failed_run_updates_manifest_and_audit_log(tmp_path):
         yaml.safe_dump(
             {
                 "runtime": {"backend": "serial", "workers": 1},
-                "cache": {"enabled": False, "format": "npy-memmap"},
-                "output": {"directory": str(output_dir), "window_results": "csv", "persist_full_nav": "none"},
+                "cache": {"data_enabled": False},
+                "output": {"directory": str(output_dir)},
                 "logging": {"level": "INFO", "task_logs": True, "heartbeat_seconds": 0},
             },
             sort_keys=False,
@@ -413,13 +538,16 @@ def test_failed_run_updates_manifest_and_audit_log(tmp_path):
 
     with pytest.raises(ModuleNotFoundError):
         mining.run_mining(parameter_path, performance_path)
-    manifest = yaml.safe_load((output_dir / "run_manifest.json").read_text(encoding="utf-8"))
-    assert manifest["status"] == "failed"
-    assert "ModuleNotFoundError" in manifest["error"]
-    assert "Traceback" in manifest["traceback"]
-    audit = Path(manifest["audit_log"]).read_text(encoding="utf-8")
+    run_dirs = list((output_dir / "BROKEN").iterdir())
+    assert len(run_dirs) == 1
+    metadata = yaml.safe_load((run_dirs[0] / "metadata.yaml").read_text(encoding="utf-8"))
+    assert metadata["status"] == "failed"
+    assert "ModuleNotFoundError" in metadata["error"]
+    assert "Traceback" in metadata["traceback"]
+    audit = (run_dirs[0] / "audit" / "运行日志.log").read_text(encoding="utf-8")
     assert "参数挖掘失败" in audit
     assert "ModuleNotFoundError" in audit
+    assert (run_dirs[0] / "audit" / "挖掘审计.xlsx").exists()
     assert not any(
         getattr(handler, "_betalens_mining_handler", False)
         for handler in mining._LOGGER.handlers

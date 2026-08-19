@@ -9,6 +9,7 @@ import itertools
 import json
 import math
 from bisect import bisect_left
+from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 
@@ -192,22 +193,32 @@ def generate_coarse_candidates(parameters: Mapping[str, Mapping[str, Any]], conf
     return _dedupe(rows)
 
 
+@dataclass(frozen=True)
+class FineGridPlan:
+    candidates: list[dict[str, Any]]
+    anchors: list[dict[str, Any]]
+    dimensions: dict[str, list[Any]]
+    local_bounds: dict[str, dict[str, Any]]
+
+
 def generate_fine_candidates(
     parameters: Mapping[str, Mapping[str, Any]],
     anchors: Sequence[Mapping[str, Any]],
     config: Mapping[str, Any],
     coarse_candidates: Sequence[Mapping[str, Any]] | None = None,
-) -> list[dict[str, Any]]:
+) -> FineGridPlan:
     """Generate a bounded local grid around coarse winners."""
     if not anchors:
-        return []
+        return FineGridPlan([], [], {}, {})
     points = max(1, int(config.get("points_per_dimension", 7)))
     max_candidates = max(1, int(config.get("max_candidates", 256)))
     dimensions: dict[str, list[Any]] = {}
+    local_bounds: dict[str, dict[str, Any]] = {}
     for name, spec in parameters.items():
         kind = str(spec.get("type", "float")).lower()
         if kind in {"categorical", "choice", "bool", "boolean"}:
             dimensions[name] = list(spec.get("choices", [False, True] if kind in {"bool", "boolean"} else []))
+            local_bounds[name] = {"type": "categorical", "values": dimensions[name]}
             continue
         values = sorted(float(row[name]) for row in anchors if name in row)
         low, high = float(spec["low"]), float(spec["high"])
@@ -234,14 +245,28 @@ def generate_fine_candidates(
         local["low"] = max(low, min(local_lows))
         local["high"] = min(high, max(local_highs))
         dimensions[name] = _values(local, points)
+        local_bounds[name] = {
+            "type": kind,
+            "global_low": spec["low"],
+            "global_high": spec["high"],
+            "local_low": local["low"],
+            "local_high": local["high"],
+            "values": dimensions[name],
+        }
     names = list(dimensions)
     candidates = [dict(zip(names, values)) for values in itertools.product(*(dimensions[name] for name in names))]
-    return _dedupe(candidates)[:max_candidates]
+    return FineGridPlan(
+        candidates=_dedupe(candidates)[:max_candidates],
+        anchors=[dict(value) for value in anchors],
+        dimensions=dimensions,
+        local_bounds=local_bounds,
+    )
 
 
 __all__ = [
     "create_coarse_study",
     "create_fine_grid_study",
+    "FineGridPlan",
     "generate_coarse_candidates",
     "generate_fine_candidates",
     "suggest_params",

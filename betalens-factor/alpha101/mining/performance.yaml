@@ -5,16 +5,10 @@ runtime:
   max_memory_ratio: 0.5
 
 cache:
-  enabled: true
-  directory: outputs/mining/_cache
-  rebuild: false
-  format: npy-memmap
+  data_enabled: true
 
 output:
   directory: outputs/mining
-  window_results: parquet
-  summary_results: csv
-  persist_full_nav: selected_only
 
 logging:
   level: INFO

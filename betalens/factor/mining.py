@@ -8,7 +8,6 @@ import logging
 import math
 import multiprocessing as mp
 import os
-import shutil
 import sys
 import threading
 import time
@@ -18,6 +17,7 @@ import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from logging.handlers import QueueHandler, QueueListener
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, Sequence
@@ -25,13 +25,17 @@ from typing import Any, Callable, Literal, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
+from betalens.factor.mining_audit import (
+    FactorMiningResult,
+    MiningResult,
+    MiningTask,
+)
+
 
 _LOGGER_NAME = "betalens.factor.mining"
 _LOGGER = logging.getLogger(_LOGGER_NAME)
 _TASK_LOGS = False
 _HEARTBEAT_SECONDS = 30.0
-_ACTIVE_RUN_MANIFEST: dict[str, Any] | None = None
-_ACTIVE_RUN_MANIFEST_PATH: Path | None = None
 
 
 class _ChineseLogFormatter(logging.Formatter):
@@ -145,8 +149,7 @@ def _heartbeat_fields(fields: Mapping[str, Any]) -> str:
 
 
 def _configure_mining_logging(
-    output_dir: Path,
-    run_id: str,
+    log_path: Path,
     level: int,
     *,
     task_logs: bool,
@@ -160,15 +163,13 @@ def _configure_mining_logging(
         if getattr(handler, "_betalens_mining_handler", False):
             _LOGGER.removeHandler(handler)
             handler.close()
-    log_dir = output_dir / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    audit_path = log_dir / f"mining_{run_id}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     formatter = _ChineseLogFormatter(
         "%(asctime)s %(level_cn)-2s [%(process_cn)s PID=%(process)d] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     console = logging.StreamHandler(sys.stdout)
-    audit = logging.FileHandler(audit_path, encoding="utf-8")
+    audit = logging.FileHandler(log_path, encoding="utf-8")
     for handler in (console, audit):
         handler.setLevel(level)
         handler.setFormatter(formatter)
@@ -176,11 +177,11 @@ def _configure_mining_logging(
         _LOGGER.addHandler(handler)
     _LOGGER.setLevel(level)
     _LOGGER.propagate = False
-    return audit_path
+    return log_path
 
 
 def _close_mining_logging() -> None:
-    global _ACTIVE_RUN_MANIFEST, _ACTIVE_RUN_MANIFEST_PATH, _HEARTBEAT_SECONDS, _TASK_LOGS
+    global _HEARTBEAT_SECONDS, _TASK_LOGS
     for handler in list(_LOGGER.handlers):
         if getattr(handler, "_betalens_mining_handler", False):
             handler.flush()
@@ -188,8 +189,6 @@ def _close_mining_logging() -> None:
             handler.close()
     _TASK_LOGS = False
     _HEARTBEAT_SECONDS = 30.0
-    _ACTIVE_RUN_MANIFEST = None
-    _ACTIVE_RUN_MANIFEST_PATH = None
 
 
 def _configure_worker_logging(
@@ -296,16 +295,6 @@ class MiningData:
     universe: list[str]
     industry_by_scheme: dict[str, pd.DataFrame] = field(default_factory=dict)
     cache_manifest_path: str | None = None
-
-
-@dataclass
-class MiningResult:
-    coarse_window_results: pd.DataFrame
-    coarse_summary: pd.DataFrame
-    fine_window_results: pd.DataFrame
-    fine_summary: pd.DataFrame
-    selected_candidates: pd.DataFrame
-    output_dir: Path
 
 
 def _load_yaml(path: str | Path) -> dict[str, Any]:
@@ -722,7 +711,7 @@ def _load_cached_data(manifest_path: str | Path) -> MiningData:
     from betalens.factor.mining_cache import MiningCache
 
     started = time.perf_counter()
-    _LOGGER.info("开始加载共享缓存：清单=%s", manifest_path)
+    _LOGGER.info("开始加载任务输入缓存：清单=%s", manifest_path)
     cache = MiningCache(manifest_path)
     manifest = cache.manifest
     pit_frame = cache.load("pit") if manifest.get("pit") else None
@@ -750,7 +739,7 @@ def _load_cached_data(manifest_path: str | Path) -> MiningData:
         ]
     )
     _LOGGER.info(
-        "共享缓存加载完成：数据集=%d，证券数=%d，驻留内存约=%s，耗时=%s",
+        "任务输入缓存加载完成：数据集=%d，证券数=%d，驻留内存约=%s，耗时=%s",
         len(loaded.inputs) + len(loaded.industry_by_scheme) + 3,
         len(loaded.universe),
         _human_bytes(resident),
@@ -759,7 +748,13 @@ def _load_cached_data(manifest_path: str | Path) -> MiningData:
     return loaded
 
 
-def _fetch_data(spec: MiningSpec, span: tuple[str, str], performance: Mapping[str, Any], params: Mapping[str, Any]) -> MiningData:
+def _fetch_data(
+    spec: MiningSpec,
+    span: tuple[str, str],
+    performance: Mapping[str, Any],
+    params: Mapping[str, Any],
+    cache_dir: Path,
+) -> MiningData:
     from betalens.datafeed import get_absolute_trade_days
 
     started = time.perf_counter()
@@ -840,24 +835,22 @@ def _fetch_data(spec: MiningSpec, span: tuple[str, str], performance: Mapping[st
         return payload
 
     cache_config = performance.get("cache", {}) or {}
-    if not bool(cache_config.get("enabled", True)):
+    if not bool(cache_config.get("data_enabled", True)):
         _LOGGER.info("缓存已关闭，将直接从数据源查询")
         payload = builder()
         loaded = MiningData(**{name: payload[name] for name in ("inputs", "price", "execution_price", "trade_status", "pit", "universe", "industry_by_scheme")})
         _LOGGER.info("因子数据准备完成：来源=直接查询，耗时=%s", _elapsed(started))
         return loaded
     from betalens.factor.mining_cache import CacheRequest, MiningCache
-    directory = cache_config.get("directory") or Path(performance.get("output", {}).get("directory", "outputs/mining")) / "_cache"
     cache = MiningCache.open_or_build(
         CacheRequest(
-            directory,
+            cache_dir,
             _cache_signature(spec, fetch_start, end, performance, universe, pit),
-            bool(cache_config.get("rebuild", False)),
         ),
         builder=builder,
     )
     loaded = _load_cached_data(cache.manifest_path)
-    _LOGGER.info("因子数据准备完成：来源=共享缓存，耗时=%s", _elapsed(started))
+    _LOGGER.info("因子数据准备完成：来源=任务输入缓存，耗时=%s", _elapsed(started))
     return loaded
 
 
@@ -1073,45 +1066,6 @@ def _call_fit(callback: Callable, data: MiningData, params: Mapping[str, Any], w
             return callback(data, params)
 
 
-def _persist_nav(nav: pd.Series | pd.DataFrame, candidate_id: str, name: str, evaluation: Mapping[str, Any]) -> None:
-    staging = evaluation.get("_nav_staging")
-    if not staging:
-        return
-    value = nav.iloc[:, 0] if isinstance(nav, pd.DataFrame) and nav.shape[1] else pd.Series(nav)
-    value = pd.Series(value).dropna()
-    if value.empty:
-        return
-    target = Path(str(staging)) / candidate_id
-    target.mkdir(parents=True, exist_ok=True)
-    safe_name = "".join(character if character.isalnum() or character in {"-", "_"} else "_" for character in name)
-    payload = np.empty(len(value), dtype=[("datetime_ns", "<i8"), ("nav", "<f8")])
-    payload["datetime_ns"] = pd.DatetimeIndex(value.index).asi8
-    payload["nav"] = pd.to_numeric(value, errors="coerce").to_numpy(dtype=float)
-    np.save(target / f"{safe_name}.npy", payload, allow_pickle=False)
-
-
-def _publish_selected_nav(staging: Path | None, output_dir: Path, selected_ids: set[str]) -> Path | None:
-    if staging is None or not staging.exists():
-        return None
-    run_directory = output_dir / "selected_nav" / staging.name
-    if selected_ids:
-        run_directory.mkdir(parents=True, exist_ok=False)
-        for candidate_id in sorted(selected_ids):
-            source = staging / candidate_id
-            if source.exists():
-                source.replace(run_directory / candidate_id)
-    resolved_staging = staging.resolve()
-    expected_parent = (output_dir / ".nav_staging").resolve()
-    if resolved_staging.parent != expected_parent:
-        raise RuntimeError(f"refusing to clean unexpected nav staging path: {resolved_staging}")
-    shutil.rmtree(resolved_staging)
-    try:
-        expected_parent.rmdir()
-    except OSError:
-        pass
-    return run_directory if run_directory.exists() else None
-
-
 def _evaluate_candidate(module: str, factor_id: str, params: Mapping[str, Any], stage: str, windows: Sequence[MiningWindow], data: MiningData, evaluation: Mapping[str, Any]) -> list[dict[str, Any]]:
     candidate_started = time.perf_counter()
     params = dict(params)
@@ -1167,7 +1121,6 @@ def _evaluate_candidate(module: str, factor_id: str, params: Mapping[str, Any], 
             nav_started = time.perf_counter()
             with _heartbeat("candidate.nav", stage=stage, candidate=candidate, engine=engine):
                 full_nav = _vector_nav(full_weights, data.price) if engine == "vector" else _exact_nav(full_weights, data, spec, amount, tolerance)
-            _persist_nav(full_nav, candidate, "full", evaluation)
             if _TASK_LOGS:
                 _LOGGER.info(
                     "%s候选 %s：全程净值回测完成，观测数=%d，耗时=%s",
@@ -1223,8 +1176,6 @@ def _evaluate_candidate(module: str, factor_id: str, params: Mapping[str, Any], 
                 nav = full_nav
             if nav is None or len(nav) == 0:
                 raise ValueError("empty nav")
-            if mode == "rolling_fit" or spec.window_transform is not None:
-                _persist_nav(nav, candidate, window.window_id, evaluation)
             index = pd.DatetimeIndex(nav.index)
             keep = (index.normalize() >= pd.Timestamp(window.start)) & (index.normalize() <= pd.Timestamp(window.end))
             metrics = metrics_from_nav(pd.Series(nav.to_numpy()[keep], index=index[keep]))
@@ -1322,21 +1273,46 @@ def _summary(frame: pd.DataFrame, selection: Mapping[str, Any]) -> pd.DataFrame:
     valid = frame[frame["error"].isna()]
     if valid.empty:
         return pd.DataFrame()
-    summary = valid.groupby(["factor_id", "candidate_id"]).agg(
-        valid_window_count=("window_id", "size"),
-        sharpe_mean=("sharpe", "mean"),
-        sharpe_median=("sharpe", "median"),
-        sharpe_p25=("sharpe", lambda value: value.quantile(0.25)),
-        max_mdd=("mdd", "max"),
-        turnover_mean=("turnover", "mean"),
-        rank_ic_median=("rank_ic", "median"),
-    ).reset_index().merge(total.reset_index(), on=["factor_id", "candidate_id"])
+    groups = valid.groupby(["factor_id", "candidate_id"])
+    summary = (
+        groups.size().rename("valid_window_count").reset_index()
+        .merge(total.reset_index(), on=["factor_id", "candidate_id"], how="left")
+    )
+    excluded = {
+        "stage", "window_id", "window_start", "window_end", "error",
+        "factor_id", "candidate_id", "params_json",
+    }
+    parameter_names: set[str] = set()
+    if "params_json" in valid:
+        for payload in valid["params_json"].dropna().head(10):
+            try:
+                parameter_names.update(json.loads(str(payload)))
+            except (TypeError, ValueError):
+                pass
+    metric_columns = [
+        name for name in valid.columns
+        if name not in excluded
+        and name not in parameter_names
+        and pd.api.types.is_numeric_dtype(valid[name])
+    ]
+    for name in metric_columns:
+        values = groups[name].agg(
+            mean="mean",
+            median="median",
+            p25=lambda value: value.quantile(0.25),
+            min="min",
+            max="max",
+        ).add_prefix(f"{name}_").reset_index()
+        summary = summary.merge(values, on=["factor_id", "candidate_id"], how="left")
+    if "mdd_max" in summary:
+        summary["max_mdd"] = summary["mdd_max"]
     identity_columns = [
         name for name in frame.columns
         if name not in {
             "stage", "window_id", "window_start", "window_end", "ann_ret", "ann_vol",
             "sharpe", "mdd", "calmar", "turnover", "rank_ic", "robust_rank_ic",
             "mean_rank_ic", "ic_coverage", "n_days", "error", "factor_id", "candidate_id",
+            *metric_columns,
         }
     ]
     if identity_columns:
@@ -1345,7 +1321,7 @@ def _summary(frame: pd.DataFrame, selection: Mapping[str, Any]) -> pd.DataFrame:
     summary["valid_window_ratio"] = summary.valid_window_count / summary.window_count.replace(0, np.nan)
     objective = selection.get("objective", {}) or {}
     metric, aggregate = str(objective.get("metric", "sharpe")), str(objective.get("aggregate", "median"))
-    source = {("sharpe", "mean"): "sharpe_mean", ("sharpe", "median"): "sharpe_median", ("sharpe", "p25"): "sharpe_p25"}.get((metric, aggregate), metric)
+    source = f"{metric}_{aggregate}"
     if source not in summary:
         aggregators = {
             "mean": "mean",
@@ -1384,20 +1360,17 @@ def _summary(frame: pd.DataFrame, selection: Mapping[str, Any]) -> pd.DataFrame:
     return summary
 
 
-def _write_frame(frame: pd.DataFrame, path: Path, format_name: str) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if str(format_name).lower() == "parquet":
-        try:
-            frame.to_parquet(path, index=False)
-            return path
-        except (ImportError, ValueError):
-            pass
-    target = path.with_suffix(".csv")
-    frame.to_csv(target, index=False, encoding="utf-8-sig")
-    return target
-
-
-def _evaluate_stage(module: str, factor_id: str, candidates: Sequence[Mapping[str, Any]], stage: str, windows: Sequence[MiningWindow], data: MiningData, evaluation: Mapping[str, Any], runtime: Mapping[str, Any]) -> pd.DataFrame:
+def _evaluate_stage(
+    module: str,
+    factor_id: str,
+    candidates: Sequence[Mapping[str, Any]],
+    stage: str,
+    windows: Sequence[MiningWindow],
+    data: MiningData,
+    evaluation: Mapping[str, Any],
+    runtime: Mapping[str, Any],
+    task: MiningTask,
+) -> pd.DataFrame:
     stage_started = time.perf_counter()
     total_candidates = len(candidates)
     if not candidates:
@@ -1447,6 +1420,25 @@ def _evaluate_stage(module: str, factor_id: str, candidates: Sequence[Mapping[st
         sharpe_values = [float(row["sharpe"]) for row in rows if row.get("error") is None and pd.notna(row.get("sharpe"))]
         elapsed_seconds = time.perf_counter() - stage_started
         eta = elapsed_seconds / completed * (total_candidates - completed) if completed else 0.0
+        candidate_id = _candidate_id(factor_id, candidates[index])
+        task.store.append("window_results", rows)
+        task.store.append(
+            "errors",
+            [row for row in rows if row.get("error") is not None],
+        )
+        task.store.append("search_progress", [{
+            "event": "completed",
+            "stage": stage,
+            "factor_id": factor_id,
+            "candidate_order": index + 1,
+            "completed_order": completed,
+            "candidate_id": candidate_id,
+            "params_json": json.dumps(dict(candidates[index]), ensure_ascii=False, sort_keys=True, default=str),
+            "valid_windows": len(rows) - failed,
+            "failed_windows": failed,
+            "sharpe_median": float(np.median(sharpe_values)) if sharpe_values else None,
+            "candidate_elapsed_seconds": round(time.perf_counter() - candidate_started, 6),
+        }])
         _LOGGER.info(
             "%s进度：因子=%s，已完成%d/%d个候选（%.1f%%），刚完成候选=%s，有效窗口=%d，失败窗口=%d，夏普中位数=%s，候选耗时=%s，预计剩余=%s",
             _stage_name(stage),
@@ -1454,7 +1446,7 @@ def _evaluate_stage(module: str, factor_id: str, candidates: Sequence[Mapping[st
             completed,
             total_candidates,
             completed / total_candidates * 100,
-            _candidate_id(factor_id, candidates[index]),
+            candidate_id,
             len(rows) - failed,
             failed,
             f"{float(np.median(sharpe_values)):.4f}" if sharpe_values else "暂无",
@@ -1580,17 +1572,217 @@ def _all_alpha_configs() -> dict[str, Any]:
     return aggregate_mining_factors()
 
 
-def _run_mining(parameter_config_path: str | Path, performance_config_path: str | Path) -> MiningResult:
-    """Run sparse coarse search followed by an automatically refined grid."""
-    global _ACTIVE_RUN_MANIFEST, _ACTIVE_RUN_MANIFEST_PATH
+def _selection_reason(status: str) -> str:
+    return {
+        "selected": "通过筛选并进入排名范围",
+        "filtered": "未通过筛选条件",
+        "candidate": "通过筛选但未进入排名范围",
+    }.get(str(status), str(status))
+
+
+def _summary_records(frame: pd.DataFrame, stage: str) -> list[dict[str, Any]]:
+    records = []
+    for rank, row in enumerate(frame.to_dict(orient="records"), 1):
+        records.append({
+            "stage": stage,
+            "rank": rank,
+            **row,
+            "selection_reason": _selection_reason(row.get("selection_status")),
+        })
+    return records
+
+
+def _run_factor(
+    task: MiningTask,
+    factor_id: str,
+    factor_config: Mapping[str, Any],
+    parameters_config: Mapping[str, Any],
+    performance: Mapping[str, Any],
+    evaluation: Mapping[str, Any],
+    windows: Sequence[MiningWindow],
+) -> FactorMiningResult:
     from betalens.factor.mining_optuna import (
         create_coarse_study,
         create_fine_grid_study,
         generate_fine_candidates,
     )
-    import yaml
 
-    run_started = time.perf_counter()
+    started = time.perf_counter()
+    module = str(factor_config.get("module") or "")
+    mode = str(factor_config.get("execution_mode", "")).lower()
+    if not module:
+        raise ValueError(f"factor {factor_id} is missing module")
+    if mode not in {"precomputed", "rolling_fit"}:
+        raise ValueError(f"factor {factor_id} requires execution_mode=precomputed or rolling_fit")
+    parameter_specs = dict(factor_config.get("parameters") or {})
+    if str(factor_id).upper().startswith("ALPHA"):
+        number = int(str(factor_id).upper().replace("ALPHA", ""))
+        parameter_specs.setdefault("alpha_id", {"type": "int", "low": number, "high": number, "step": 1})
+    validate_parameter_specs(parameter_specs)
+    task.write_metadata(execution_mode=mode)
+    _LOGGER.info(
+        "开始处理因子：因子=%s，模块=%s，执行模式=%s，待挖掘参数=%s，任务目录=%s",
+        factor_id, module, _mode_name(mode), ",".join(parameter_specs), task.run_dir,
+    )
+    sample = {name: spec.get("high", (spec.get("choices") or [None])[0]) for name, spec in parameter_specs.items()}
+    sample["factor_id"] = factor_id
+    factor_evaluation = {**dict(evaluation), **dict(factor_config.get("evaluation") or {})}
+    imported_spec = _import_spec(module, sample)
+    if mode != str(imported_spec.execution_mode).lower():
+        raise ValueError(
+            f"factor {factor_id} execution_mode={mode} does not match make_mining_spec={imported_spec.execution_mode}"
+        )
+    span = factor_evaluation["span"]
+    data = _fetch_data(imported_spec, (str(span[0]), str(span[1])), performance, sample, task.cache_dir)
+    cache_signature = _cache_signature(imported_spec, str(span[0]), str(span[1]), performance, data.universe, data.pit)
+    task.write_metadata(cache_signature=cache_signature, cache_manifest=data.cache_manifest_path)
+
+    search = parameters_config.get("search") or {}
+    selection = parameters_config.get("selection") or {}
+    direction = str((selection.get("objective") or {}).get("direction", "maximize")).lower()
+    runtime = performance.get("runtime") or {}
+    coarse_config = search.get("coarse") or {}
+    coarse_study = create_coarse_study(coarse_config, direction=direction)
+    coarse_trials, coarse_candidates = _ask_candidates(
+        coarse_study, parameter_specs, max(1, int(coarse_config.get("n_trials", 32))),
+    )
+    for value in coarse_candidates:
+        value.setdefault("factor_id", factor_id)
+    task.store.append("search_progress", [{
+        "event": "planned", "stage": "coarse", "factor_id": factor_id,
+        "candidate_order": index + 1, "trial_number": getattr(trial, "number", index),
+        "candidate_id": _candidate_id(str(factor_id), value), "source": "optuna",
+        "params_json": json.dumps(value, ensure_ascii=False, sort_keys=True, default=str),
+    } for index, (trial, value) in enumerate(zip(coarse_trials, coarse_candidates))])
+    _LOGGER.info("粗搜候选已生成：因子=%s，候选=%d，每个候选窗口=%d", factor_id, len(coarse_candidates), len(windows))
+    coarse = _evaluate_stage(
+        module, str(factor_id), coarse_candidates, "coarse", windows, data,
+        factor_evaluation, runtime, task,
+    )
+    coarse_summary = _summary(coarse, selection)
+    coarse_records = _summary_records(coarse_summary, "coarse")
+    task.store.append("candidate_summary", coarse_records)
+    task.store.append("search_progress", [{"event": "summarized", **row} for row in coarse_records])
+    _tell_candidates(coarse_study, coarse_trials, coarse_candidates, str(factor_id), coarse_summary)
+    _LOGGER.info("粗搜筛选完成：因子=%s，汇总候选=%d", factor_id, len(coarse_summary))
+
+    fine_config = search.get("fine") or {}
+    anchors = []
+    if not coarse_summary.empty:
+        anchor_ids = coarse_summary.loc[
+            coarse_summary.selection_status == "selected", "candidate_id"
+        ].head(int(fine_config.get("top_k", 8)))
+        for candidate_id in anchor_ids:
+            row = coarse[coarse.candidate_id == candidate_id].iloc[0]
+            anchors.append({name: row[name] for name in parameter_specs})
+    fine_plan = generate_fine_candidates(
+        parameter_specs, anchors, fine_config, coarse_candidates=coarse_candidates,
+    )
+    fine_candidates = list(fine_plan.candidates)
+    fine_trials = []
+    fine_study = None
+    if fine_candidates:
+        fine_space, fine_specs = _grid_specs(parameter_specs, fine_candidates)
+        fine_study = create_fine_grid_study(
+            fine_space, direction=direction,
+            seed=int(coarse_config.get("seed", 20260818)),
+        )
+        max_grid = math.prod(len(values) for values in fine_space.values())
+        fine_trials, fine_candidates = _ask_candidates(
+            fine_study, fine_specs,
+            min(max_grid, max(1, int(fine_config.get("max_candidates", 256)))),
+        )
+        for value in fine_candidates:
+            value.setdefault("factor_id", factor_id)
+    plan_details = {
+        "anchors_json": json.dumps(fine_plan.anchors, ensure_ascii=False, default=str),
+        "local_bounds_json": json.dumps(fine_plan.local_bounds, ensure_ascii=False, default=str),
+    }
+    task.store.append("search_progress", [{
+        "event": "planned", "stage": "fine", "factor_id": factor_id,
+        "candidate_order": index + 1, "trial_number": getattr(trial, "number", index),
+        "candidate_id": _candidate_id(str(factor_id), value), "source": "local_grid",
+        "params_json": json.dumps(value, ensure_ascii=False, sort_keys=True, default=str),
+        **plan_details,
+    } for index, (trial, value) in enumerate(zip(fine_trials, fine_candidates))])
+
+    coarse_ids = set(coarse.candidate_id) if not coarse.empty else set()
+    reused, pending = [], []
+    for value in fine_candidates:
+        candidate_id = _candidate_id(str(factor_id), value)
+        if candidate_id in coarse_ids:
+            rows = coarse.loc[coarse.candidate_id == candidate_id].copy()
+            rows["stage"] = "fine"
+            reused.append(rows)
+            task.store.append("window_results", rows.to_dict(orient="records"))
+            task.store.append("search_progress", [{
+                "event": "completed", "stage": "fine", "factor_id": factor_id,
+                "candidate_id": candidate_id, "source": "reused_from_coarse",
+                "params_json": json.dumps(value, ensure_ascii=False, sort_keys=True, default=str),
+            }])
+        else:
+            pending.append(value)
+    _LOGGER.info(
+        "细搜候选已生成：因子=%s，候选总数=%d，复用粗搜结果=%d，待计算=%d",
+        factor_id, len(fine_candidates), len(reused), len(pending),
+    )
+    evaluated = _evaluate_stage(
+        module, str(factor_id), pending, "fine", windows, data,
+        factor_evaluation, runtime, task,
+    )
+    fine_parts = [*reused, evaluated]
+    fine = pd.concat([value for value in fine_parts if not value.empty], ignore_index=True) if any(not value.empty for value in fine_parts) else pd.DataFrame()
+    fine_summary = _summary(fine, selection)
+    fine_records = _summary_records(fine_summary, "fine")
+    task.store.append("candidate_summary", fine_records)
+    task.store.append("search_progress", [{"event": "summarized", **row} for row in fine_records])
+    _LOGGER.info(
+        "细搜筛选完成：因子=%s，汇总候选=%d，最终入选=%d，被过滤=%d",
+        factor_id,
+        len(fine_summary),
+        int((fine_summary.selection_status == "selected").sum()) if not fine_summary.empty else 0,
+        int((fine_summary.selection_status == "filtered").sum()) if not fine_summary.empty else 0,
+    )
+    if fine_study is not None:
+        _tell_candidates(fine_study, fine_trials, fine_candidates, str(factor_id), fine_summary)
+    selected = fine_summary[fine_summary.selection_status == "selected"].copy() if not fine_summary.empty else pd.DataFrame()
+    winner_records = []
+    for rank, row in enumerate(selected.to_dict(orient="records"), 1):
+        winner_records.append({"rank": rank, **row})
+    task.store.append("winners", winner_records)
+    result = FactorMiningResult(
+        factor_id=str(factor_id), run_id=task.run_id, run_dir=task.run_dir, status="complete",
+        coarse_window_results=coarse, coarse_summary=coarse_summary,
+        fine_window_results=fine, fine_summary=fine_summary, selected_candidates=selected,
+    )
+    _LOGGER.info(
+        "因子挖掘完成：因子=%s，粗搜候选=%d，细搜候选=%d，最终入选=%d，耗时=%s",
+        factor_id, len(coarse_summary), len(fine_summary), len(selected), _elapsed(started),
+    )
+    return result
+
+
+def _validate_performance_config(performance: Mapping[str, Any]) -> None:
+    output = performance.get("output") or {}
+    cache = performance.get("cache") or {}
+    legacy_output = {"window_results", "summary_results", "persist_full_nav"}.intersection(output)
+    legacy_cache = {"enabled", "directory", "rebuild", "format"}.intersection(cache)
+    if legacy_output or legacy_cache:
+        keys = sorted([f"output.{key}" for key in legacy_output] + [f"cache.{key}" for key in legacy_cache])
+        raise ValueError(f"legacy mining performance options are not supported: {', '.join(keys)}")
+    runtime = performance.get("runtime") or {}
+    if str(runtime.get("backend", "process")).lower() not in {"process", "serial"}:
+        raise ValueError("runtime.backend must be process or serial")
+    if int(runtime.get("workers", 1)) < 1 or int(runtime.get("chunk_size", 1)) < 1:
+        raise ValueError("runtime.workers and runtime.chunk_size must be positive")
+    if not 0 < float(runtime.get("max_memory_ratio", 0.5)) <= 1:
+        raise ValueError("runtime.max_memory_ratio must be in (0, 1]")
+    if not isinstance(cache.get("data_enabled", True), bool):
+        raise ValueError("cache.data_enabled must be boolean")
+
+
+def run_mining(parameter_config_path: str | Path, performance_config_path: str | Path) -> MiningResult:
+    """Run one isolated mining task per factor and return the launch result."""
     parameter_path = Path(parameter_config_path).resolve()
     performance_path = Path(performance_config_path).resolve()
     factor_directory = parameter_path.parent.parent
@@ -1598,59 +1790,15 @@ def _run_mining(parameter_config_path: str | Path, performance_config_path: str 
         sys.path.insert(0, str(factor_directory))
     parameters_config = _load_yaml(parameter_path)
     performance = _load_yaml(performance_path)
-    log_config = performance.get("logging") or {}
-    level_name = str(log_config.get("level", "INFO")).upper()
-    levels = logging.getLevelNamesMapping()
-    if level_name not in levels:
-        raise ValueError(f"unsupported logging.level: {level_name}")
-    heartbeat_seconds = float(log_config.get("heartbeat_seconds", 30))
-    if heartbeat_seconds < 0:
-        raise ValueError("logging.heartbeat_seconds must be >= 0")
-    if int(parameters_config.get("version", 1)) != 1:
-        raise ValueError(f"unsupported mining parameter_space version: {parameters_config.get('version')}")
-    base = performance_path.parent
-    for section, key in (("output", "directory"), ("cache", "directory")):
-        value = (performance.get(section) or {}).get(key)
-        if value and not Path(str(value)).is_absolute():
-            performance[section][key] = str((base / str(value)).resolve())
-    output_config = performance.get("output") or {}
-    output_dir = Path(output_config.get("directory", "outputs/mining"))
-    output_dir.mkdir(parents=True, exist_ok=True)
-    run_id = f"{pd.Timestamp.now(tz='UTC').strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}"
-    audit_path = _configure_mining_logging(
-        output_dir,
-        run_id,
-        levels[level_name],
-        task_logs=bool(log_config.get("task_logs", True)),
-        heartbeat_seconds=heartbeat_seconds,
-    )
-    started_at = pd.Timestamp.now(tz="UTC").isoformat()
-    _ACTIVE_RUN_MANIFEST_PATH = output_dir / "run_manifest.json"
-    _ACTIVE_RUN_MANIFEST = {
-        "run_id": run_id,
-        "status": "running",
-        "started_at": started_at,
-        "parameter_config": str(parameter_path),
-        "performance_config": str(performance_path),
-        "audit_log": str(audit_path),
-    }
-    _ACTIVE_RUN_MANIFEST_PATH.write_text(
-        json.dumps(_ACTIVE_RUN_MANIFEST, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    _validate_performance_config(performance)
     try:
         import optuna
 
         optuna.logging.set_verbosity(optuna.logging.WARNING)
     except ImportError:
         pass
-    _LOGGER.info(
-        "开始参数挖掘：运行编号=%s，参数空间配置=%s，性能配置=%s，审计日志=%s",
-        run_id,
-        parameter_path,
-        performance_path,
-        audit_path,
-    )
+    if int(parameters_config.get("version", 1)) != 1:
+        raise ValueError(f"unsupported mining parameter_space version: {parameters_config.get('version')}")
     factors = parameters_config.get("factors") or {}
     if factors == "all":
         if str(parameters_config.get("factor_class", "")).lower() != "alpha101":
@@ -1660,351 +1808,81 @@ def _run_mining(parameter_config_path: str | Path, performance_config_path: str 
         factors = {str(value["id"]): value for value in factors}
     if not isinstance(factors, Mapping) or not factors:
         raise ValueError("factors must be a non-empty mapping or `all`")
-    _LOGGER.info(
-        "挖掘范围已确认：因子类别=%s，因子数=%d，因子=%s",
-        parameters_config.get("factor_class"),
-        len(factors),
-        ",".join(map(str, factors)),
-    )
     evaluation = dict(parameters_config.get("evaluation") or {})
     span = tuple(evaluation.get("span") or parameters_config.get("span") or ())
-    if len(span) != 2:
-        raise ValueError("evaluation.span must contain [start, end]")
-    if pd.Timestamp(span[0]) > pd.Timestamp(span[1]):
-        raise ValueError("evaluation.span start must not exceed end")
+    if len(span) != 2 or pd.Timestamp(span[0]) > pd.Timestamp(span[1]):
+        raise ValueError("evaluation.span must contain an ordered [start, end]")
     evaluation["span"] = [str(span[0]), str(span[1])]
-    window_config = parameters_config.get("windows") or {}
-    lengths, steps = _validate_window_config(window_config)
+    lengths, steps = _validate_window_config(parameters_config.get("windows") or {})
     windows = _windows((str(span[0]), str(span[1])), lengths, steps)
     if not windows:
         raise ValueError("windows produced no complete windows")
-    _LOGGER.info(
-        "滑动窗口已生成：评价区间=%s 至 %s，窗口长度=%s日，滑动步长=%s日，共%d个窗口",
-        span[0],
-        span[1],
-        lengths,
-        steps,
-        len(windows),
-    )
-    runtime = performance.get("runtime") or {}
-    backend = str(runtime.get("backend", "process")).lower()
-    if backend not in {"process", "serial"}:
-        raise ValueError("runtime.backend must be process or serial")
-    if int(runtime.get("workers", 1)) < 1 or int(runtime.get("chunk_size", 1)) < 1:
-        raise ValueError("runtime.workers and runtime.chunk_size must be positive")
-    memory_ratio = float(runtime.get("max_memory_ratio", 0.5))
-    if not 0 < memory_ratio <= 1:
-        raise ValueError("runtime.max_memory_ratio must be in (0, 1]")
-    cache_config = performance.get("cache") or {}
-    if str(cache_config.get("format", "npy-memmap")).lower() != "npy-memmap":
-        raise ValueError("cache.format must be npy-memmap")
-    if str(output_config.get("window_results", "parquet")).lower() not in {"parquet", "csv"}:
-        raise ValueError("output.window_results must be parquet or csv")
-    persist_nav = str(output_config.get("persist_full_nav", "selected_only")).lower()
-    if persist_nav not in {"none", "selected_only"}:
-        raise ValueError("output.persist_full_nav must be none or selected_only")
-    nav_staging = None
-    if persist_nav == "selected_only":
-        nav_staging = output_dir / ".nav_staging" / run_id
-        nav_staging.mkdir(parents=True, exist_ok=False)
-    search = parameters_config.get("search") or {}
-    selection = parameters_config.get("selection") or {}
-    objective_config = selection.get("objective", {}) or {}
-    direction = str(objective_config.get("direction", "maximize")).lower()
+    direction = str(((parameters_config.get("selection") or {}).get("objective") or {}).get("direction", "maximize")).lower()
     if direction not in {"maximize", "minimize"}:
         raise ValueError("selection.objective.direction must be maximize or minimize")
-    _LOGGER.info(
-        "运行配置：运行方式=%s，进程数=%d，启用缓存=%s，缓存目录=%s，回测引擎=%s，优化目标=%s的%s（%s），输出目录=%s，详细任务日志=%s，存活提示间隔=%s秒",
-        _backend_name(backend),
-        int(runtime.get("workers", 1)),
-        _yes_no(cache_config.get("enabled", True)),
-        cache_config.get("directory"),
-        _engine_name(evaluation.get("engine", "vector")),
-        _metric_name(objective_config.get("metric", "sharpe")),
-        _aggregate_name(objective_config.get("aggregate", "median")),
-        _direction_name(direction),
-        output_dir,
-        _yes_no(_TASK_LOGS),
-        _HEARTBEAT_SECONDS,
-    )
-    coarse_windows, coarse_summaries, fine_windows, fine_summaries, selections = [], [], [], [], []
+    output_value = (performance.get("output") or {}).get("directory", "outputs/mining")
+    output_root = Path(str(output_value))
+    if not output_root.is_absolute():
+        output_root = (performance_path.parent / output_root).resolve()
+    launch_id = f"{datetime.now().astimezone().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    log_config = performance.get("logging") or {}
+    level_name = str(log_config.get("level", "INFO")).upper()
+    levels = logging.getLevelNamesMapping()
+    if level_name not in levels:
+        raise ValueError(f"unsupported logging.level: {level_name}")
+    heartbeat_seconds = float(log_config.get("heartbeat_seconds", 30))
+    if heartbeat_seconds < 0:
+        raise ValueError("logging.heartbeat_seconds must be >= 0")
     factor_runs = []
-    for factor_position, (factor_id, factor_config) in enumerate(factors.items(), 1):
-        factor_started = time.perf_counter()
+    for factor_id, factor_config in factors.items():
         if not isinstance(factor_config, Mapping):
             raise TypeError(f"factor {factor_id} configuration must be a mapping")
-        module = str(factor_config.get("module") or "")
-        if not module:
-            raise ValueError(f"factor {factor_id} is missing module")
-        if str(factor_config.get("execution_mode", "")).lower() not in {"precomputed", "rolling_fit"}:
-            raise ValueError(f"factor {factor_id} requires execution_mode=precomputed or rolling_fit")
-        parameter_specs = dict(factor_config.get("parameters") or {})
-        if str(factor_id).upper().startswith("ALPHA"):
-            number = int(str(factor_id).upper().replace("ALPHA", ""))
-            parameter_specs.setdefault("alpha_id", {"type": "int", "low": number, "high": number, "step": 1})
-        validate_parameter_specs(parameter_specs)
-        _LOGGER.info(
-            "开始处理第%d/%d个因子：因子=%s，模块=%s，执行模式=%s，待挖掘参数=%s",
-            factor_position,
-            len(factors),
-            factor_id,
-            module,
-            _mode_name(factor_config.get("execution_mode")),
-            ",".join(parameter_specs),
+        task = MiningTask.create(
+            output_root, str(factor_id), launch_id,
+            factor_class=parameters_config.get("factor_class"),
+            parameter_path=parameter_path,
+            performance_path=performance_path,
+            config={"parameter_space": parameters_config, "performance": performance},
         )
-        sample = {name: spec.get("high", (spec.get("choices") or [None])[0]) for name, spec in parameter_specs.items()}
-        sample["factor_id"] = factor_id
-        factor_evaluation = {**evaluation, **dict(factor_config.get("evaluation") or {})}
-        if nav_staging is not None:
-            factor_evaluation["_nav_staging"] = str(nav_staging)
-        imported_spec = _import_spec(module, sample)
-        declared_mode = factor_config.get("execution_mode")
-        if declared_mode and str(declared_mode).lower() != str(imported_spec.execution_mode).lower():
-            raise ValueError(
-                f"factor {factor_id} execution_mode={declared_mode} does not match "
-                f"make_mining_spec={imported_spec.execution_mode}"
-            )
-        data = _fetch_data(imported_spec, (str(span[0]), str(span[1])), performance, sample)
-        coarse_config = search.get("coarse") or {}
-        _LOGGER.info(
-            "开始生成粗搜候选：因子=%s，采样器=%s，计划试验数=%d，随机种子=%s",
-            factor_id,
-            coarse_config.get("sampler", "random"),
-            max(1, int(coarse_config.get("n_trials", 32))),
-            coarse_config.get("seed", 20260818),
+        _configure_mining_logging(
+            task.log_path, levels[level_name],
+            task_logs=bool(log_config.get("task_logs", True)),
+            heartbeat_seconds=heartbeat_seconds,
         )
-        coarse_study = create_coarse_study(coarse_config, direction=direction)
-        coarse_trials, coarse_candidates = _ask_candidates(
-            coarse_study,
-            parameter_specs,
-            max(1, int(coarse_config.get("n_trials", 32))),
-        )
-        for value in coarse_candidates:
-            value.setdefault("factor_id", factor_id)
-        _LOGGER.info(
-            "粗搜候选已生成：因子=%s，去重后候选=%d，每个候选窗口=%d，窗口任务总数=%d",
-            factor_id,
-            len(coarse_candidates),
-            len(windows),
-            len(coarse_candidates) * len(windows),
-        )
-        coarse = _evaluate_stage(module, str(factor_id), coarse_candidates, "coarse", windows, data, factor_evaluation, runtime)
-        coarse_summary = _summary(coarse, selection)
-        _LOGGER.info(
-            "粗搜筛选完成：因子=%s，汇总候选=%d，进入细搜=%d，被过滤=%d",
-            factor_id,
-            len(coarse_summary),
-            int((coarse_summary.selection_status == "selected").sum()) if not coarse_summary.empty else 0,
-            int((coarse_summary.selection_status == "filtered").sum()) if not coarse_summary.empty else 0,
-        )
-        _tell_candidates(coarse_study, coarse_trials, coarse_candidates, str(factor_id), coarse_summary)
-        coarse_windows.append(coarse)
-        coarse_summaries.append(coarse_summary)
-        fine_config = search.get("fine") or {}
-        anchors = []
-        if not coarse_summary.empty:
-            for candidate in coarse_summary.loc[coarse_summary.selection_status == "selected", "candidate_id"].head(int(fine_config.get("top_k", 8))):
-                row = coarse[coarse.candidate_id == candidate].iloc[0]
-                anchors.append({name: row[name] for name in parameter_specs})
-        fine_candidates = generate_fine_candidates(
-            parameter_specs,
-            anchors,
-            fine_config,
-            coarse_candidates=coarse_candidates,
-        )
-        _LOGGER.info(
-            "开始生成细搜网格：因子=%s，优胜锚点=%d，初步网格候选=%d，每维点数=%d，候选上限=%d",
-            factor_id,
-            len(anchors),
-            len(fine_candidates),
-            int(fine_config.get("points_per_dimension", 7)),
-            int(fine_config.get("max_candidates", 256)),
-        )
-        fine_trials = []
-        fine_study = None
-        if fine_candidates:
-            fine_space, fine_specs = _grid_specs(parameter_specs, fine_candidates)
-            fine_study = create_fine_grid_study(
-                fine_space,
-                direction=direction,
-                seed=int((search.get("coarse") or {}).get("seed", 20260818)),
-            )
-            max_grid = math.prod(len(values) for values in fine_space.values())
-            fine_trials, fine_candidates = _ask_candidates(
-                fine_study,
-                fine_specs,
-                min(max_grid, max(1, int(fine_config.get("max_candidates", 256)))),
-            )
-            for value in fine_candidates:
-                value.setdefault("factor_id", factor_id)
-        coarse_ids = set(coarse.candidate_id) if not coarse.empty else set()
-        reused = []
-        pending = []
-        for value in fine_candidates:
-            candidate = _candidate_id(str(factor_id), value)
-            if candidate in coarse_ids:
-                rows = coarse.loc[coarse.candidate_id == candidate].copy()
-                rows["stage"] = "fine"
-                reused.append(rows)
-            else:
-                pending.append(value)
-        _LOGGER.info(
-            "细搜候选已生成：因子=%s，候选总数=%d，复用粗搜结果=%d，待计算=%d，窗口任务总数=%d",
-            factor_id,
-            len(fine_candidates),
-            len(reused),
-            len(pending),
-            len(pending) * len(windows),
-        )
-        evaluated = _evaluate_stage(module, str(factor_id), pending, "fine", windows, data, factor_evaluation, runtime)
-        fine_parts = [*reused, evaluated]
-        fine = pd.concat([value for value in fine_parts if not value.empty], ignore_index=True) if any(not value.empty for value in fine_parts) else pd.DataFrame()
-        fine_summary = _summary(fine, selection)
-        _LOGGER.info(
-            "细搜筛选完成：因子=%s，汇总候选=%d，最终入选=%d，被过滤=%d",
-            factor_id,
-            len(fine_summary),
-            int((fine_summary.selection_status == "selected").sum()) if not fine_summary.empty else 0,
-            int((fine_summary.selection_status == "filtered").sum()) if not fine_summary.empty else 0,
-        )
-        if fine_study is not None:
-            _tell_candidates(fine_study, fine_trials, fine_candidates, str(factor_id), fine_summary)
-        fine_windows.append(fine)
-        fine_summaries.append(fine_summary)
-        if not fine_summary.empty:
-            selections.append(fine_summary[fine_summary.selection_status == "selected"])
-        factor_runs.append({
-            "factor_id": str(factor_id),
-            "execution_mode": str(imported_spec.execution_mode),
-            "cache_manifest": data.cache_manifest_path,
-            "coarse_candidates": len({_candidate_id(str(factor_id), value) for value in coarse_candidates}),
-            "fine_candidates": len({_candidate_id(str(factor_id), value) for value in fine_candidates}),
-            "selected_candidates": int((fine_summary.selection_status == "selected").sum()) if not fine_summary.empty else 0,
-        })
-        _LOGGER.info(
-            "第%d/%d个因子处理完成：因子=%s，粗搜候选=%d，细搜候选=%d，最终入选=%d，耗时=%s",
-            factor_position,
-            len(factors),
-            factor_id,
-            factor_runs[-1]["coarse_candidates"],
-            factor_runs[-1]["fine_candidates"],
-            factor_runs[-1]["selected_candidates"],
-            _elapsed(factor_started),
-        )
-    coarse_window = pd.concat(coarse_windows, ignore_index=True) if coarse_windows else pd.DataFrame()
-    coarse_summary = pd.concat(coarse_summaries, ignore_index=True) if coarse_summaries else pd.DataFrame()
-    fine_window = pd.concat(fine_windows, ignore_index=True) if fine_windows else pd.DataFrame()
-    fine_summary = pd.concat(fine_summaries, ignore_index=True) if fine_summaries else pd.DataFrame()
-    selected = pd.concat(selections, ignore_index=True) if selections else pd.DataFrame()
-    _LOGGER.info(
-        "开始汇总并写入结果：粗搜窗口结果=%d条，粗搜候选=%d，细搜窗口结果=%d条，细搜候选=%d，最终入选=%d",
-        len(coarse_window),
-        len(coarse_summary),
-        len(fine_window),
-        len(fine_summary),
-        len(selected),
-    )
-    output_files = []
-    output_files.append(_write_frame(coarse_window, output_dir / "coarse_window_results.parquet", output_config.get("window_results", "parquet")))
-    coarse_summary_path = output_dir / "coarse_summary.csv"
-    coarse_summary.to_csv(coarse_summary_path, index=False, encoding="utf-8-sig")
-    output_files.append(coarse_summary_path)
-    output_files.append(_write_frame(fine_window, output_dir / "fine_window_results.parquet", output_config.get("window_results", "parquet")))
-    fine_summary_path = output_dir / "fine_summary.csv"
-    fine_summary.to_csv(fine_summary_path, index=False, encoding="utf-8-sig")
-    output_files.append(fine_summary_path)
-    selected_csv_path = output_dir / "selected_candidates.csv"
-    selected.to_csv(selected_csv_path, index=False, encoding="utf-8-sig")
-    output_files.append(selected_csv_path)
-    selected_yaml_path = output_dir / "selected_candidates.yaml"
-    selected_yaml_path.write_text(yaml.safe_dump(selected.to_dict(orient="records"), allow_unicode=True, sort_keys=False), encoding="utf-8")
-    output_files.append(selected_yaml_path)
-    if not selected.empty:
-        for row in selected.to_dict(orient="records"):
+        try:
             _LOGGER.info(
-                "候选最终入选：因子=%s，候选=%s，目标值=%s，参数=%s",
-                row.get("factor_id"),
-                row.get("candidate_id"),
-                row.get("objective"),
-                row.get("params_json"),
+                "开始参数挖掘：启动编号=%s，运行编号=%s，因子=%s，任务目录=%s",
+                launch_id, task.run_id, factor_id, task.run_dir,
             )
-    errors = pd.concat([value for value in (coarse_window, fine_window) if not value.empty], ignore_index=True) if not coarse_window.empty or not fine_window.empty else pd.DataFrame()
-    errors_path = output_dir / "errors.jsonl"
-    with errors_path.open("w", encoding="utf-8") as stream:
-        if not errors.empty:
-            for record in errors[errors.error.notna()].to_dict(orient="records"):
-                stream.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-    output_files.append(errors_path)
-    selected_nav_directory = _publish_selected_nav(
-        nav_staging,
-        output_dir,
-        set(selected.candidate_id) if not selected.empty else set(),
-    )
-    manifest = {
-        "run_id": run_id,
-        "status": "complete",
-        "started_at": started_at,
-        "completed_at": pd.Timestamp.now(tz="UTC").isoformat(),
-        "elapsed_seconds": round(time.perf_counter() - run_started, 3),
-        "parameter_config": str(parameter_path),
-        "performance_config": str(performance_path),
-        "audit_log": str(audit_path),
-        "factor_class": parameters_config.get("factor_class"),
-        "factors": factor_runs,
-        "windows": {"lengths": lengths, "steps": steps, "count": len(windows)},
-        "runtime": dict(runtime),
-        "cache": dict(cache_config),
-        "output": dict(output_config),
-        "result_rows": {
-            "coarse_windows": len(coarse_window),
-            "fine_windows": len(fine_window),
-            "selected_candidates": len(selected),
-        },
-        "selected_nav_directory": str(selected_nav_directory) if selected_nav_directory else None,
-    }
-    manifest_path = _ACTIVE_RUN_MANIFEST_PATH
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    _ACTIVE_RUN_MANIFEST = manifest
-    output_files.append(manifest_path)
-    for path in output_files:
-        _LOGGER.info("结果文件已写入：路径=%s，大小=%s", path, _human_bytes(path.stat().st_size))
-    _LOGGER.info(
-        "参数挖掘完成：运行编号=%s，最终入选=%d，错误窗口=%d，总耗时=%s，输出目录=%s，审计日志=%s",
-        run_id,
-        len(selected),
-        int(errors.error.notna().sum()) if not errors.empty else 0,
-        _elapsed(run_started),
-        output_dir,
-        audit_path,
-    )
-    return MiningResult(coarse_window, coarse_summary, fine_window, fine_summary, selected, output_dir)
-
-
-def run_mining(parameter_config_path: str | Path, performance_config_path: str | Path) -> MiningResult:
-    """Run mining with live console progress and a persistent audit log."""
-    try:
-        return _run_mining(parameter_config_path, performance_config_path)
-    except Exception as exc:
-        if _LOGGER.handlers:
+            result = _run_factor(
+                task, str(factor_id), factor_config, parameters_config,
+                performance, evaluation, windows,
+            )
+            task.finish(result, status="complete", windows={"lengths": lengths, "steps": steps, "count": len(windows)})
+            factor_runs.append(result)
+            _LOGGER.info("审计结果已生成：%s", task.workbook_path)
+        except Exception as exc:
             _LOGGER.exception("参数挖掘失败：错误类型=%s，错误信息=%s", type(exc).__name__, exc)
-        if _ACTIVE_RUN_MANIFEST is not None and _ACTIVE_RUN_MANIFEST_PATH is not None:
-            failed = {
-                **_ACTIVE_RUN_MANIFEST,
-                "status": "failed",
-                "failed_at": pd.Timestamp.now(tz="UTC").isoformat(),
-                "error": f"{type(exc).__name__}: {exc}",
+            task.store.append("errors", [{
+                "stage": "run", "factor_id": str(factor_id),
+                "error_type": type(exc).__name__, "error": str(exc),
                 "traceback": traceback.format_exc(),
-            }
-            _ACTIVE_RUN_MANIFEST_PATH.write_text(
-                json.dumps(failed, ensure_ascii=False, indent=2),
-                encoding="utf-8",
+            }])
+            failed = FactorMiningResult(
+                factor_id=str(factor_id), run_id=task.run_id, run_dir=task.run_dir, status="failed",
             )
-        raise
-    finally:
-        _close_mining_logging()
+            task.finish(
+                failed, status="failed", error=f"{type(exc).__name__}: {exc}",
+                traceback=traceback.format_exc(),
+            )
+            raise
+        finally:
+            _close_mining_logging()
+    return MiningResult(launch_id=launch_id, factor_runs=tuple(factor_runs))
 
 
 __all__ = [
+    "FactorMiningResult",
     "MiningData",
     "MiningResult",
     "MiningSpec",

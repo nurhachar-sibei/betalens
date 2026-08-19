@@ -5,7 +5,6 @@ import hashlib
 import json
 import logging
 import os
-import socket
 import shutil
 import time
 import uuid
@@ -141,75 +140,6 @@ def _write_pit(root: Path, pit: Mapping[Any, set[str]] | None, universe: list[st
     return _write_frame(root, "__pit_mask__", frame, dtype="bool")
 
 
-def _lock_payload() -> dict[str, Any]:
-    return {
-        "host": socket.gethostname(),
-        "pid": os.getpid(),
-        "process_started_at": _process_started_at(os.getpid()),
-        "started_at": time.time(),
-        "heartbeat_at": time.time(),
-        "owner_token": uuid.uuid4().hex,
-    }
-
-
-def _process_started_at(pid: int) -> float | None:
-    try:
-        import psutil
-
-        return float(psutil.Process(int(pid)).create_time())
-    except Exception:
-        return None
-
-
-def _pid_active(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        import ctypes
-
-        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))
-        if not handle:
-            return False
-        ctypes.windll.kernel32.CloseHandle(handle)
-        return True
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
-
-
-def _lock_owner_active(owner: Mapping[str, Any]) -> bool:
-    if str(owner.get("host") or socket.gethostname()) != socket.gethostname():
-        return True
-    pid = int(owner.get("pid", -1))
-    if not _pid_active(pid):
-        return False
-    recorded = owner.get("process_started_at")
-    actual = _process_started_at(pid)
-    return recorded is None or actual is None or abs(float(recorded) - actual) < 1.0
-
-
-def _acquire_build_lock(path: Path) -> dict[str, Any]:
-    owner = _lock_payload()
-    while True:
-        try:
-            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                json.dump(owner, stream)
-                stream.flush()
-                os.fsync(stream.fileno())
-            return owner
-        except FileExistsError:
-            try:
-                existing = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
-                existing = {"pid": -1}
-            if _lock_owner_active(existing):
-                raise RuntimeError(f"mining cache is being built: lock={path} holder={existing}")
-            path.unlink(missing_ok=True)
-
-
 def publish(
     cache_dir: str | Path,
     signature: str,
@@ -222,70 +152,44 @@ def publish(
     pit: Mapping[Any, set[str]] | None,
     universe: list[str],
     metadata: Mapping[str, Any],
-    rebuild: bool = False,
 ) -> Path:
     cache_dir = Path(cache_dir).resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
-    ready = cache_dir / "READY.json"
-    if ready.exists() and not rebuild:
-        current = json.loads(ready.read_text(encoding="utf-8"))
-        if current.get("cache_signature") == signature:
-            manifest = cache_dir / current["manifest"]
-            if manifest.exists():
-                return manifest
-
-    lock = cache_dir / f"{signature}.build.lock"
-    owner = _acquire_build_lock(lock)
-    generation = f"{signature}-{time.time_ns()}" if rebuild else signature
-    staging = cache_dir / f".{generation}.staging-{os.getpid()}"
-    final = cache_dir / generation
+    manifest = cache_dir / "input_manifest.json"
+    final = cache_dir / "datasets"
+    if manifest.exists() or final.exists():
+        raise FileExistsError(f"task input cache already exists: {cache_dir}")
+    staging = cache_dir / f".datasets.staging-{os.getpid()}-{uuid.uuid4().hex}"
     try:
-        if final.exists() and not rebuild:
-            manifest = final / "manifest.json"
-        else:
-            staging.mkdir(parents=True, exist_ok=False)
-            datasets = {
-                "inputs": {name: _write_frame(staging, f"input:{name}", frame) for name, frame in inputs.items()},
-                "price": _write_frame(staging, "price", price),
-                "execution_price": _write_frame(staging, "execution_price", execution_price),
-                "trade_status": _write_frame(staging, "trade_status", trade_status, dtype="int8"),
-                "industry_by_scheme": {
-                    name: _write_frame(staging, f"industry:{name}", frame)
-                    for name, frame in industry_by_scheme.items()
-                },
-                "pit": _write_pit(staging, pit, universe),
-            }
-            manifest_payload = {
-                "schema_version": 3,
-                "cache_signature": signature,
-                "created_at": time.time(),
-                "universe": universe,
-                "datasets": datasets,
-                "metadata": dict(metadata),
-            }
-            manifest = staging / "manifest.json"
-            _json_write(manifest, manifest_payload)
-            for descriptor in _iter_descriptors(datasets):
-                _validate_descriptor(staging, descriptor)
-            os.replace(staging, final)
-            manifest = final / "manifest.json"
-        temporary = cache_dir / f"READY.json.tmp-{os.getpid()}"
+        staging.mkdir(parents=True, exist_ok=False)
+        datasets = {
+            "inputs": {name: _write_frame(staging, f"input:{name}", frame) for name, frame in inputs.items()},
+            "price": _write_frame(staging, "price", price),
+            "execution_price": _write_frame(staging, "execution_price", execution_price),
+            "trade_status": _write_frame(staging, "trade_status", trade_status, dtype="int8"),
+            "industry_by_scheme": {
+                name: _write_frame(staging, f"industry:{name}", frame)
+                for name, frame in industry_by_scheme.items()
+            },
+            "pit": _write_pit(staging, pit, universe),
+        }
+        for descriptor in _iter_descriptors(datasets):
+            _validate_descriptor(staging, descriptor)
+        os.replace(staging, final)
+        temporary = cache_dir / f".input_manifest.{uuid.uuid4().hex}.tmp"
         _json_write(temporary, {
-            "schema_version": 3,
+            "schema_version": 4,
             "cache_signature": signature,
-            "manifest": str(manifest.relative_to(cache_dir)),
+            "created_at": time.time(),
+            "universe": universe,
+            "datasets": datasets,
+            "metadata": dict(metadata),
         })
-        os.replace(temporary, ready)
+        os.replace(temporary, manifest)
         return manifest
     finally:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
-        try:
-            current = json.loads(lock.read_text(encoding="utf-8"))
-        except Exception:
-            current = {}
-        if current.get("owner_token") == owner.get("owner_token"):
-            lock.unlink(missing_ok=True)
 
 
 def _iter_descriptors(datasets: Mapping[str, Any]):
@@ -340,9 +244,9 @@ def _load_descriptor(root: Path, descriptor: Mapping[str, Any] | None) -> dict[s
 def open_manifest(path: str | Path) -> dict[str, Any]:
     path = Path(path).resolve()
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if int(payload.get("schema_version", -1)) != 3:
+    if int(payload.get("schema_version", -1)) != 4:
         raise RuntimeError(f"unsupported mining cache schema: {payload.get('schema_version')}")
-    root = path.parent
+    root = path.parent / "datasets"
     datasets = payload["datasets"]
     return {
         "manifest": payload,
@@ -408,20 +312,17 @@ def estimated_resident_bytes(path: str | Path) -> int:
 
 @dataclass(frozen=True)
 class CacheRequest:
-    """Description of an immutable mining data generation."""
+    """Description of one task-local mining input cache."""
 
     directory: str | Path
     signature: str
-    rebuild: bool = False
 
 
 class MiningCache:
-    """Small public facade over the immutable memmap-v3 cache.
+    """Small public facade over the task-local memmap cache.
 
-    The mining runner only needs ``open_or_build`` and ``load``.  The existing
-    low-level ``publish``/``open_manifest`` functions remain available for the
-    builder used by the data provider, but cache policy no longer leaks into
-    the scheduler or worker code.
+    One task writes one ``input_manifest.json`` and one ``datasets`` directory.
+    Workers only load immutable slices from those files.
     """
 
     def __init__(self, manifest_path: str | Path):
@@ -433,55 +334,32 @@ class MiningCache:
         started = time.perf_counter()
         directory = Path(request.directory).resolve()
         directory.mkdir(parents=True, exist_ok=True)
-        ready = directory / "READY.json"
-        damaged = False
+        manifest = directory / "input_manifest.json"
         signature_short = request.signature[:12]
         _LOGGER.info(
-            "开始检查共享缓存：目录=%s，签名=%s，强制重建=%s",
+            "开始检查任务输入缓存：目录=%s，签名=%s",
             directory,
             signature_short,
-            "是" if request.rebuild else "否",
         )
-        if ready.exists() and not request.rebuild:
-            try:
-                pointer = json.loads(ready.read_text(encoding="utf-8"))
-                manifest = directory / str(pointer["manifest"])
-                payload = json.loads(manifest.read_text(encoding="utf-8"))
-                if payload.get("cache_signature") == request.signature:
-                    _LOGGER.info(
-                        "共享缓存命中：签名=%s，清单=%s，耗时=%.1f秒",
-                        signature_short,
-                        manifest,
-                        time.perf_counter() - started,
-                    )
-                    return cls(manifest)
-                _LOGGER.info(
-                    "共享缓存未命中：原因=数据签名已变化，请求签名=%s，现有签名=%s",
-                    signature_short,
-                    str(payload.get("cache_signature", ""))[:12],
-                )
-            except (OSError, ValueError, KeyError, TypeError):
-                damaged = True
-                _LOGGER.warning("共享缓存清单损坏，将重新构建：就绪文件=%s", ready, exc_info=True)
-        elif request.rebuild:
-            _LOGGER.info("共享缓存未命中：原因=配置要求强制重建，签名=%s", signature_short)
-        else:
-            _LOGGER.info("共享缓存未命中：原因=尚未建立缓存，签名=%s", signature_short)
+        if manifest.exists():
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            if payload.get("cache_signature") != request.signature:
+                raise RuntimeError("task input cache signature mismatch")
+            return cls(manifest)
         if builder is None:
             raise FileNotFoundError(
                 f"mining cache generation {request.signature} is missing; provide a builder"
             )
-        _LOGGER.info("开始构建共享缓存：签名=%s", signature_short)
+        _LOGGER.info("开始构建任务输入缓存：签名=%s", signature_short)
         payload = builder()
-        _LOGGER.info("开始原子发布共享缓存：签名=%s", signature_short)
+        _LOGGER.info("开始原子发布任务输入缓存：签名=%s", signature_short)
         manifest = publish(
             directory,
             request.signature,
-            rebuild=request.rebuild or damaged,
             **payload,
         )
         _LOGGER.info(
-            "共享缓存构建完成：签名=%s，清单=%s，总耗时=%.1f秒",
+            "任务输入缓存构建完成：签名=%s，清单=%s，总耗时=%.1f秒",
             signature_short,
             manifest,
             time.perf_counter() - started,

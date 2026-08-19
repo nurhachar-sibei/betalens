@@ -31,7 +31,11 @@ def main() -> int:
     )
     args = parser.parse_args()
     result = run_mining(args.parameters, args.performance)
-    print(f"挖掘程序已结束：最终入选={len(result.selected_candidates)}，输出目录={result.output_dir}")
+    for factor_run in result.factor_runs:
+        print(
+            f"挖掘程序已结束：因子={factor_run.factor_id}，"
+            f"最终入选={len(factor_run.selected_candidates)}，任务目录={factor_run.run_dir}"
+        )
     return 0
 
 
