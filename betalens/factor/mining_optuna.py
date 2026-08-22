@@ -8,6 +8,8 @@ from __future__ import annotations
 import itertools
 import json
 import math
+import random
+import warnings
 from bisect import bisect_left
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
@@ -95,7 +97,24 @@ def create_coarse_study(config: Mapping[str, Any], *, direction: str = "maximize
     if sampler_name == "random":
         sampler = optuna.samplers.RandomSampler(seed=seed)
     elif sampler_name == "tpe":
-        sampler = optuna.samplers.TPESampler(seed=seed)
+        sampler = optuna.samplers.TPESampler(
+            seed=seed,
+            n_startup_trials=max(1, int(config.get("n_startup_trials", 10))),
+            multivariate=bool(config.get("multivariate", False)),
+        )
+    elif sampler_name == "qmc":
+        qmc_type = str(config.get("qmc_type", "sobol")).lower()
+        if qmc_type not in {"sobol", "halton"}:
+            raise ValueError("qmc_type must be sobol or halton")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", optuna.exceptions.ExperimentalWarning)
+            sampler = optuna.samplers.QMCSampler(
+                qmc_type=qmc_type,
+                scramble=bool(config.get("scramble", True)),
+                seed=seed,
+                warn_asynchronous_seeding=False,
+                warn_independent_sampling=False,
+            )
     else:
         raise ValueError(f"unsupported coarse sampler: {sampler_name}")
     return optuna.create_study(sampler=sampler, direction=direction)
@@ -130,6 +149,40 @@ def tell_trial(study, trial, value: float | None) -> None:
         # permits that call from optimize(), not from the documented ask/tell API.
         if "Study.stop" not in str(exc):
             raise
+
+
+def seed_study_with_results(
+    study,
+    parameter_specs: Mapping[str, Mapping[str, Any]],
+    candidates: Sequence[Mapping[str, Any]],
+    values: Sequence[float],
+) -> int:
+    """将已完成的外部候选作为历史 trial 导入新的自适应 study。"""
+    if len(candidates) != len(values):
+        raise ValueError("seed candidates and values must have the same length")
+    optuna = _optuna()
+    distributions = {
+        name: to_optuna_distribution(spec)
+        for name, spec in parameter_specs.items()
+    }
+    added = 0
+    for candidate, value in zip(candidates, values):
+        if value is None or not math.isfinite(float(value)):
+            continue
+        params = {}
+        for name, spec in parameter_specs.items():
+            raw = candidate[name]
+            kind = str(spec.get("type", "float")).lower()
+            params[name] = _choice_token(raw) if kind in {"categorical", "choice", "bool", "boolean"} else raw
+        study.add_trial(
+            optuna.trial.create_trial(
+                params=params,
+                distributions=distributions,
+                value=float(value),
+            )
+        )
+        added += 1
+    return added
 
 
 def _values(spec: Mapping[str, Any], count: int) -> list[Any]:
@@ -201,6 +254,157 @@ class FineGridPlan:
     local_bounds: dict[str, dict[str, Any]]
 
 
+def _numeric_position(value: float, spec: Mapping[str, Any]) -> float:
+    low, high = float(spec["low"]), float(spec["high"])
+    if high == low:
+        return 0.5
+    if str(spec.get("scale", "linear")).lower() == "log" and low > 0 and value > 0:
+        return (math.log(value) - math.log(low)) / (math.log(high) - math.log(low))
+    return (value - low) / (high - low)
+
+
+def detect_boundary_pressure(
+    parameters: Mapping[str, Mapping[str, Any]],
+    winners: Sequence[Mapping[str, Any]],
+    *,
+    tolerance: float = 0.1,
+    winner_ratio: float = 0.67,
+) -> dict[str, dict[str, Any]]:
+    """识别优胜候选持续靠近同一参数边界的维度。"""
+    if not 0 <= float(tolerance) < 0.5:
+        raise ValueError("boundary tolerance must be in [0, 0.5)")
+    if not 0 < float(winner_ratio) <= 1:
+        raise ValueError("boundary winner_ratio must be in (0, 1]")
+    pressure = {}
+    for name, spec in parameters.items():
+        kind = str(spec.get("type", "float")).lower()
+        if kind in {"categorical", "choice", "bool", "boolean"} or float(spec["low"]) == float(spec["high"]):
+            continue
+        positions = [_numeric_position(float(row[name]), spec) for row in winners if name in row]
+        if not positions:
+            continue
+        low_ratio = sum(value <= tolerance for value in positions) / len(positions)
+        high_ratio = sum(value >= 1 - tolerance for value in positions) / len(positions)
+        sides = []
+        if low_ratio >= winner_ratio:
+            sides.append("low")
+        if high_ratio >= winner_ratio:
+            sides.append("high")
+        if sides:
+            pressure[name] = {
+                "sides": sides,
+                "low_ratio": low_ratio,
+                "high_ratio": high_ratio,
+                "winner_count": len(positions),
+            }
+    return pressure
+
+
+def expand_parameter_specs(
+    parameters: Mapping[str, Mapping[str, Any]],
+    pressure: Mapping[str, Mapping[str, Any]],
+    *,
+    multiplier: float = 3.0,
+    limits: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """根据边界压力向命中侧扩展参数，并受硬边界限制。"""
+    if not math.isfinite(float(multiplier)) or float(multiplier) <= 1:
+        raise ValueError("expansion multiplier must be finite and > 1")
+    output = {name: dict(spec) for name, spec in parameters.items()}
+    for name, hit in pressure.items():
+        if name not in output:
+            continue
+        spec = output[name]
+        low, high = float(spec["low"]), float(spec["high"])
+        sides = set(hit.get("sides") or [])
+        log_scale = str(spec.get("scale", "linear")).lower() == "log"
+        if log_scale:
+            proposed_low = low / float(multiplier) if "low" in sides else low
+            proposed_high = high * float(multiplier) if "high" in sides else high
+        else:
+            width = max(high - low, abs(low), abs(high), 1e-12)
+            proposed_low = low - width * (float(multiplier) - 1) if "low" in sides else low
+            proposed_high = high + width * (float(multiplier) - 1) if "high" in sides else high
+        hard = dict((limits or {}).get(name, {}))
+        if hard.get("low") is not None:
+            proposed_low = max(proposed_low, float(hard["low"]))
+        if hard.get("high") is not None:
+            proposed_high = min(proposed_high, float(hard["high"]))
+        kind = str(spec.get("type", "float")).lower()
+        if kind in {"int", "integer"}:
+            proposed_low, proposed_high = int(math.floor(proposed_low)), int(math.ceil(proposed_high))
+        spec["low"], spec["high"] = proposed_low, proposed_high
+    return output
+
+
+@dataclass(frozen=True)
+class PerturbationPlan:
+    candidates: list[dict[str, Any]]
+    metadata: dict[str, dict[str, Any]]
+
+
+def generate_perturbation_candidates(
+    parameters: Mapping[str, Mapping[str, Any]],
+    winners: Sequence[Mapping[str, Any]],
+    *,
+    perturbations_per_candidate: int = 8,
+    radius_ratio: float = 0.1,
+    seed: int = 20260818,
+) -> PerturbationPlan:
+    """在赢家附近按参数尺度生成可复现的随机扰动候选。"""
+    if int(perturbations_per_candidate) < 1:
+        raise ValueError("perturbations_per_candidate must be positive")
+    if not 0 < float(radius_ratio) <= 0.5:
+        raise ValueError("stability radius_ratio must be in (0, 0.5]")
+    rng = random.Random(int(seed))
+    candidates, metadata, seen = [], {}, set()
+    for winner_rank, winner in enumerate(winners, 1):
+        parent_id = str(winner.get("candidate_id", ""))
+        base = {name: winner[name] for name in parameters if name in winner}
+        attempts = 0
+        generated = 0
+        while generated < int(perturbations_per_candidate) and attempts < int(perturbations_per_candidate) * 20:
+            attempts += 1
+            candidate = dict(base)
+            changed = False
+            for name, spec in parameters.items():
+                kind = str(spec.get("type", "float")).lower()
+                if name not in candidate or kind in {"categorical", "choice", "bool", "boolean"}:
+                    continue
+                low, high = float(spec["low"]), float(spec["high"])
+                if low == high:
+                    continue
+                center = float(candidate[name])
+                if str(spec.get("scale", "linear")).lower() == "log":
+                    radius = (math.log(high) - math.log(low)) * float(radius_ratio)
+                    value = math.exp(math.log(center) + rng.uniform(-radius, radius))
+                else:
+                    value = center + rng.uniform(-1, 1) * (high - low) * float(radius_ratio)
+                value = max(low, min(high, value))
+                if kind in {"int", "integer"}:
+                    step = int(spec.get("step") or 1)
+                    value = int(low + round((value - low) / step) * step)
+                    value = max(int(low), min(int(high), value))
+                elif spec.get("step"):
+                    step = float(spec["step"])
+                    value = low + round((value - low) / step) * step
+                    value = max(low, min(high, value))
+                changed = changed or value != candidate[name]
+                candidate[name] = value
+            token = json.dumps(candidate, ensure_ascii=False, sort_keys=True, default=str)
+            if not changed or token in seen:
+                continue
+            seen.add(token)
+            candidates.append(candidate)
+            metadata[token] = {
+                "parent_candidate_id": parent_id,
+                "winner_rank": winner_rank,
+                "perturbation_index": generated + 1,
+            }
+            generated += 1
+    return PerturbationPlan(candidates, metadata)
+
+
 def generate_fine_candidates(
     parameters: Mapping[str, Mapping[str, Any]],
     anchors: Sequence[Mapping[str, Any]],
@@ -267,9 +471,14 @@ __all__ = [
     "create_coarse_study",
     "create_fine_grid_study",
     "FineGridPlan",
+    "PerturbationPlan",
+    "detect_boundary_pressure",
+    "expand_parameter_specs",
     "generate_coarse_candidates",
     "generate_fine_candidates",
+    "generate_perturbation_candidates",
     "suggest_params",
+    "seed_study_with_results",
     "tell_trial",
     "to_optuna_distribution",
 ]

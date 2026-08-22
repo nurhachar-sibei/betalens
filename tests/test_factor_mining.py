@@ -12,11 +12,17 @@ import pytest
 import yaml
 
 import betalens.factor.mining as mining
+import betalens.factor.mining_optuna as mining_optuna
 from betalens.factor.mining_cache import CacheRequest, MiningCache
 from betalens.factor.mining_optuna import (
     create_coarse_study,
     create_fine_grid_study,
+    detect_boundary_pressure,
+    expand_parameter_specs,
+    generate_coarse_candidates,
     generate_fine_candidates,
+    generate_perturbation_candidates,
+    seed_study_with_results,
     suggest_params,
     tell_trial,
 )
@@ -62,6 +68,112 @@ def test_optuna_search_supports_log_and_composite_categories():
         seen.append(suggest_params(trial, categorical_specs))
         tell_trial(grid, trial, 0.0)
     assert len({str(row) for row in seen}) == 4
+
+
+def test_qmc_wide_search_boundary_expansion_and_perturbations_are_bounded():
+    specs = {
+        "window": {"type": "int", "low": 1, "high": 100, "step": 1, "scale": "log"},
+        "weight": {"type": "float", "low": 0.0, "high": 1.0, "scale": "linear"},
+    }
+    candidates = generate_coarse_candidates(
+        specs,
+        {"sampler": "qmc", "qmc_type": "sobol", "scramble": True, "seed": 7, "n_trials": 16},
+    )
+    windows = {row["window"] for row in candidates}
+    assert min(windows) <= 3
+    assert max(windows) >= 60
+
+    pressure = detect_boundary_pressure(
+        specs,
+        [{"window": 80}, {"window": 90}, {"window": 100}],
+        tolerance=0.1,
+        winner_ratio=2 / 3,
+    )
+    assert pressure["window"]["sides"] == ["high"]
+    expanded = expand_parameter_specs(
+        specs,
+        pressure,
+        multiplier=3,
+        limits={"window": {"low": 1, "high": 250}},
+    )
+    assert expanded["window"]["high"] == 250
+    assert specs["window"]["high"] == 100
+
+    plan = generate_perturbation_candidates(
+        expanded,
+        [{"candidate_id": "WINNER", "window": 100, "weight": 0.5}],
+        perturbations_per_candidate=8,
+        radius_ratio=0.1,
+        seed=11,
+    )
+    assert len(plan.candidates) == 8
+    assert all(1 <= row["window"] <= 250 for row in plan.candidates)
+    assert all(0 <= row["weight"] <= 1 for row in plan.candidates)
+    assert all(row != {"window": 100, "weight": 0.5} for row in plan.candidates)
+    assert {value["parent_candidate_id"] for value in plan.metadata.values()} == {"WINNER"}
+
+    tpe = create_coarse_study({"sampler": "tpe", "seed": 9, "n_startup_trials": 1})
+    added = seed_study_with_results(
+        tpe,
+        specs,
+        [{"window": 10, "weight": 0.2}, {"window": 80, "weight": 0.8}],
+        [1.0, 2.0],
+    )
+    assert added == 2
+    assert len(tpe.trials) == 2
+    assert [trial.value for trial in tpe.trials] == [1.0, 2.0]
+
+
+def test_tpe_with_all_invalid_previous_results_does_not_raise_keyerror():
+    module = types.ModuleType("_mining_invalid_history_test")
+
+    class Factor:
+        name = "INVALID_HISTORY"
+        compute_kwargs = {}
+        weight_mode = "classic-long-short"
+
+        @staticmethod
+        def compute(**kwargs):
+            return kwargs["x"]
+
+    module.make_mining_spec = lambda params: mining.MiningSpec(Factor(), warmup_days=0)
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    try:
+        invalid = pd.DataFrame([{
+            "factor_id": "INVALID_HISTORY",
+            "candidate_id": "C",
+            "window_id": "1",
+            "error": "ValueError: empty nav",
+            "window": 3,
+        }])
+        assert mining._summary(invalid, {"objective": {"metric": "sharpe", "aggregate": "median"}}).empty
+    finally:
+        monkeypatch.undo()
+
+
+def test_alpha101_auto_space_uses_multiplier_dimensions_and_type_limits(monkeypatch):
+    alpha_dir = Path("betalens-factor/alpha101").resolve()
+    monkeypatch.syspath_prepend(str(alpha_dir))
+    sys.modules.pop("alpha101_parameters", None)
+    from alpha101_parameters import mining_parameter_specs
+
+    alpha3 = mining_parameter_specs(3)
+    window = alpha3["rank_open_rank_volume_correlation_window"]
+    assert window == {"type": "int", "low": 1, "high": 100, "scale": "log", "step": 1}
+
+    capped = mining_parameter_specs(
+        3,
+        range_multiplier=20,
+        max_dimensions=1,
+        type_limits={"window": {"low": 2, "high": 50}},
+    )
+    assert capped["rank_open_rank_volume_correlation_window"]["low"] == 2
+    assert capped["rank_open_rank_volume_correlation_window"]["high"] == 50
+
+    alpha1 = mining_parameter_specs(1, max_dimensions=1)
+    assert alpha1["returns_threshold"]["type"] == "float"
+    assert alpha1["returns_threshold"]["low"] < 0 < alpha1["returns_threshold"]["high"]
 
 
 def test_cache_open_or_build_and_slice(tmp_path):
@@ -390,9 +502,9 @@ def test_run_logging_is_live_and_persisted(tmp_path, monkeypatch, capsys):
     for marker in (
         "开始参数挖掘",
         "开始处理因子",
-        "粗搜候选已生成",
+        "开始宽范围搜索",
         "开始评价第1/",
-        "粗搜进度",
+        "宽范围粗搜进度",
         "细搜筛选完成",
         "因子挖掘完成",
     ):
@@ -428,6 +540,89 @@ def test_run_logging_is_live_and_persisted(tmp_path, monkeypatch, capsys):
     second = mining.run_mining(parameter_path, performance_path).factor_runs[0]
     assert second.run_dir != factor_run.run_dir
     assert second.run_dir.parent == factor_run.run_dir.parent
+
+
+def test_multistage_search_runs_qmc_tpe_expansion_grid_and_stability(tmp_path, monkeypatch):
+    module = types.ModuleType("_mining_multistage_test")
+
+    class Factor:
+        name = "MULTISTAGE"
+        compute_kwargs = {}
+        weight_mode = "classic-long-short"
+
+        @staticmethod
+        def compute(**kwargs):
+            return kwargs["x"]
+
+    module.make_mining_spec = lambda params: mining.MiningSpec(Factor(), warmup_days=0)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    data = _synthetic_data()
+    windows = [mining.MiningWindow("4/4/0", "2024-01-05", "2024-01-08", 4, 4)]
+    monkeypatch.setattr(mining, "_windows", lambda *args, **kwargs: windows)
+    monkeypatch.setattr(mining, "_fetch_data", lambda *args, **kwargs: data)
+    monkeypatch.setattr(
+        mining,
+        "_build_weights",
+        lambda *args, **kwargs: pd.DataFrame({"A": 1.0}, index=data.price.index),
+    )
+    monkeypatch.setattr(
+        mining,
+        "_vector_nav",
+        lambda weights, price: pd.Series(np.linspace(1.0, 1.2, len(price)), index=price.index),
+    )
+    monkeypatch.setattr(
+        mining_optuna,
+        "detect_boundary_pressure",
+        lambda *args, **kwargs: {
+            "window": {"sides": ["high"], "low_ratio": 0.0, "high_ratio": 1.0, "winner_count": 1}
+        },
+    )
+
+    parameter_path = tmp_path / "parameter_space.yaml"
+    performance_path = tmp_path / "performance.yaml"
+    output_dir = tmp_path / "output"
+    parameter_path.write_text(
+        yaml.safe_dump({
+            "version": 1,
+            "factor_class": "test",
+            "factors": {
+                "MULTISTAGE": {
+                    "module": module.__name__,
+                    "execution_mode": "precomputed",
+                    "parameters": {"window": {"type": "int", "low": 2, "high": 4, "step": 1}},
+                    "parameter_limits": {"window": {"low": 1, "high": 8}},
+                }
+            },
+            "evaluation": {"span": ["2024-01-01", "2024-01-15"], "engine": "vector", "rebal_freq": "D"},
+            "windows": {"lengths": [4], "steps": [4]},
+            "search": {
+                "coarse": {"sampler": "qmc", "qmc_type": "sobol", "n_trials": 4, "seed": 1},
+                "refine": {"enabled": True, "sampler": "tpe", "n_trials": 4, "batch_size": 2, "n_startup_trials": 1, "seed": 2},
+                "expansion": {"enabled": True, "sampler": "qmc", "n_trials": 2, "max_rounds": 1, "range_multiplier": 2, "seed": 3},
+                "fine": {"top_k": 1, "points_per_dimension": 2, "max_candidates": 2},
+                "stability": {"enabled": True, "top_k": 1, "perturbations_per_candidate": 2, "radius_ratio": 0.5, "required_pass_ratio": 0.5, "minimum_valid_ratio": 0.5, "seed": 4},
+            },
+            "selection": {"objective": {"metric": "sharpe", "aggregate": "median", "direction": "maximize"}, "top_k": 1},
+        }, sort_keys=False),
+        encoding="utf-8",
+    )
+    performance_path.write_text(
+        yaml.safe_dump({
+            "runtime": {"backend": "serial", "workers": 1},
+            "cache": {"data_enabled": False},
+            "output": {"directory": str(output_dir)},
+            "logging": {"level": "WARNING", "task_logs": False, "heartbeat_seconds": 0},
+        }, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    factor_run = mining.run_mining(parameter_path, performance_path).factor_runs[0]
+    assert {"coarse", "refine", "expansion_1", "fine", "stability"}.issubset(factor_run.stage_summaries)
+    assert factor_run.selected_candidates.iloc[0]["stability_status"] == "stable"
+    metadata = yaml.safe_load((factor_run.run_dir / "metadata.yaml").read_text(encoding="utf-8"))
+    assert "expansion_1" in metadata["result_counts"]["stage_candidates"]
+    workbook = pd.ExcelFile(factor_run.run_dir / "audit" / "挖掘审计.xlsx")
+    assert "稳定性验证" in workbook.sheet_names
 
 
 def test_multi_factor_launch_creates_isolated_task_directories(tmp_path, monkeypatch):

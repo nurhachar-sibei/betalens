@@ -59,7 +59,7 @@ windows:
 
 search:
   coarse:
-    # 可选：random | tpe。
+    # 可选：qmc | random | tpe；跨数量级数值参数的宽搜可使用 qmc。
     sampler: random
     # 粗搜试验数，正整数；重复参数会由候选 ID 去重。
     n_trials: 64

@@ -1,4 +1,4 @@
-"""Two-stage, window-aware factor parameter mining."""
+"""Multi-stage, window-aware factor parameter mining."""
 from __future__ import annotations
 
 import hashlib
@@ -61,7 +61,16 @@ class _ChineseLogFormatter(logging.Formatter):
 
 
 def _stage_name(stage: str) -> str:
-    return {"coarse": "粗搜", "fine": "细搜"}.get(str(stage).lower(), str(stage))
+    names = {
+        "coarse": "宽范围粗搜",
+        "refine": "自适应收敛搜索",
+        "fine": "局部网格细搜",
+        "stability": "赢家扰动验证",
+    }
+    value = str(stage).lower()
+    if value.startswith("expansion_"):
+        return f"第{value.rsplit('_', 1)[-1]}轮边界扩展搜索"
+    return names.get(value, str(stage))
 
 
 def _mode_name(mode: str) -> str:
@@ -1117,6 +1126,14 @@ def _evaluate_candidate(module: str, factor_id: str, params: Mapping[str, Any], 
                 full_weights.shape[1],
                 _elapsed(weights_started),
             )
+        if full_weights is None or full_weights.empty:
+            factor_nonnull = int(full_factor.notna().sum().sum()) if isinstance(full_factor, pd.DataFrame) else 0
+            pair_count = len(_signal_pairs(evaluation["span"][0], evaluation["span"][1], frequency, data.price.index))
+            raise ValueError(
+                "empty weights after factor/PIT/preprocessing: "
+                f"factor_nonnull={factor_nonnull}, signal_pairs={pair_count}, "
+                f"factor_shape={getattr(full_factor, 'shape', None)}"
+            )
         if spec.window_transform is None:
             nav_started = time.perf_counter()
             with _heartbeat("candidate.nav", stage=stage, candidate=candidate, engine=engine):
@@ -1280,7 +1297,8 @@ def _summary(frame: pd.DataFrame, selection: Mapping[str, Any]) -> pd.DataFrame:
     )
     excluded = {
         "stage", "window_id", "window_start", "window_end", "error",
-        "factor_id", "candidate_id", "params_json",
+        "factor_id", "candidate_id", "params_json", "parent_candidate_id",
+        "winner_rank", "perturbation_index",
     }
     parameter_names: set[str] = set()
     if "params_json" in valid:
@@ -1370,6 +1388,7 @@ def _evaluate_stage(
     evaluation: Mapping[str, Any],
     runtime: Mapping[str, Any],
     task: MiningTask,
+    candidate_metadata: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> pd.DataFrame:
     stage_started = time.perf_counter()
     total_candidates = len(candidates)
@@ -1421,6 +1440,10 @@ def _evaluate_stage(
         elapsed_seconds = time.perf_counter() - stage_started
         eta = elapsed_seconds / completed * (total_candidates - completed) if completed else 0.0
         candidate_id = _candidate_id(factor_id, candidates[index])
+        metadata = dict((candidate_metadata or {}).get(candidate_id, {}))
+        if metadata:
+            for row in rows:
+                row.update(metadata)
         task.store.append("window_results", rows)
         task.store.append(
             "errors",
@@ -1522,7 +1545,13 @@ def _evaluate_stage(
     return output
 
 
-def _ask_candidates(study, parameter_specs: Mapping[str, Mapping[str, Any]], count: int):
+def _ask_candidates(
+    study,
+    parameter_specs: Mapping[str, Mapping[str, Any]],
+    count: int,
+    *,
+    complete_for_sampling: bool = False,
+):
     from betalens.factor.mining_optuna import suggest_params
 
     trials, candidates = [], []
@@ -1530,6 +1559,8 @@ def _ask_candidates(study, parameter_specs: Mapping[str, Mapping[str, Any]], cou
         trial = study.ask()
         trials.append(trial)
         candidates.append(suggest_params(trial, parameter_specs))
+        if complete_for_sampling:
+            study.tell(trial, 0.0)
     return trials, candidates
 
 
@@ -1566,10 +1597,52 @@ def _grid_specs(
     return search_space, specs
 
 
-def _all_alpha_configs() -> dict[str, Any]:
-    from alpha101_parameters import aggregate_mining_factors
+def _alpha_generation_options(parameters_config: Mapping[str, Any]) -> dict[str, Any]:
+    config = dict(parameters_config.get("alpha101_parameter_generation") or {})
+    allowed = {"range_multiplier", "max_dimensions", "type_limits"}
+    unknown = sorted(set(config) - allowed)
+    if unknown:
+        raise ValueError(f"unknown alpha101_parameter_generation options: {unknown}")
+    if float(config.get("range_multiplier", 10)) <= 1:
+        raise ValueError("alpha101_parameter_generation.range_multiplier must be > 1")
+    if int(config.get("max_dimensions", 5)) < 1:
+        raise ValueError("alpha101_parameter_generation.max_dimensions must be positive")
+    return config
 
-    return aggregate_mining_factors()
+
+def _resolve_alpha_configs(
+    parameters_config: Mapping[str, Any],
+    factors: Any,
+) -> dict[str, Any]:
+    from alpha101_parameters import (
+        aggregate_mining_factors,
+        mining_parameter_limits,
+        mining_parameter_specs,
+    )
+
+    options = _alpha_generation_options(parameters_config)
+    if factors == "all":
+        return aggregate_mining_factors(**options)
+    if isinstance(factors, list):
+        factors = {str(value["id"]): value for value in factors}
+    if not isinstance(factors, Mapping):
+        return factors
+    resolved = {}
+    for factor_id, raw in factors.items():
+        factor = dict(raw) if isinstance(raw, Mapping) else raw
+        if (
+            isinstance(factor, Mapping)
+            and str(factor_id).upper().startswith("ALPHA")
+            and str(factor.get("parameters", "")).lower() == "auto"
+        ):
+            number = int(str(factor_id).upper().replace("ALPHA", ""))
+            factor["parameters"] = mining_parameter_specs(number, **options)
+            factor["parameter_limits"] = mining_parameter_limits(
+                number,
+                type_limits=options.get("type_limits"),
+            )
+        resolved[str(factor_id)] = factor
+    return resolved
 
 
 def _selection_reason(status: str) -> str:
@@ -1592,6 +1665,249 @@ def _summary_records(frame: pd.DataFrame, stage: str) -> list[dict[str, Any]]:
     return records
 
 
+def _dedupe_candidates(
+    factor_id: str,
+    candidates: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    output, seen = [], set()
+    for value in candidates:
+        candidate = dict(value)
+        candidate.setdefault("factor_id", factor_id)
+        candidate_id = _candidate_id(factor_id, candidate)
+        if candidate_id not in seen:
+            seen.add(candidate_id)
+            output.append(candidate)
+    return output
+
+
+def _evaluate_with_reuse(
+    module: str,
+    factor_id: str,
+    candidates: Sequence[Mapping[str, Any]],
+    stage: str,
+    windows: Sequence[MiningWindow],
+    data: MiningData,
+    evaluation: Mapping[str, Any],
+    runtime: Mapping[str, Any],
+    task: MiningTask,
+    *,
+    previous: pd.DataFrame | None = None,
+    candidate_metadata: Mapping[str, Mapping[str, Any]] | None = None,
+) -> pd.DataFrame:
+    candidates = _dedupe_candidates(factor_id, candidates)
+    previous = previous if previous is not None else pd.DataFrame()
+    reused, pending = [], []
+    available = set(previous.candidate_id.astype(str)) if not previous.empty and "candidate_id" in previous else set()
+    for value in candidates:
+        candidate_id = _candidate_id(factor_id, value)
+        if candidate_id not in available:
+            pending.append(value)
+            continue
+        rows = previous.loc[previous.candidate_id.astype(str) == candidate_id].copy()
+        if "window_id" in rows:
+            rows = rows.drop_duplicates("window_id", keep="last")
+        rows["stage"] = stage
+        metadata = dict((candidate_metadata or {}).get(candidate_id, {}))
+        for key, item in metadata.items():
+            rows[key] = item
+        reused.append(rows)
+        task.store.append("window_results", rows.to_dict(orient="records"))
+        task.store.append("search_progress", [{
+            "event": "completed",
+            "stage": stage,
+            "factor_id": factor_id,
+            "candidate_id": candidate_id,
+            "source": "复用已计算候选",
+            "params_json": json.dumps(value, ensure_ascii=False, sort_keys=True, default=str),
+            **metadata,
+        }])
+    evaluated = _evaluate_stage(
+        module,
+        factor_id,
+        pending,
+        stage,
+        windows,
+        data,
+        evaluation,
+        runtime,
+        task,
+        candidate_metadata=candidate_metadata,
+    )
+    parts = [*reused, evaluated]
+    return pd.concat([value for value in parts if not value.empty], ignore_index=True) if any(
+        not value.empty for value in parts
+    ) else pd.DataFrame()
+
+
+def _run_sampled_stage(
+    module: str,
+    factor_id: str,
+    parameter_specs: Mapping[str, Mapping[str, Any]],
+    config: Mapping[str, Any],
+    stage: str,
+    direction: str,
+    windows: Sequence[MiningWindow],
+    data: MiningData,
+    evaluation: Mapping[str, Any],
+    runtime: Mapping[str, Any],
+    selection: Mapping[str, Any],
+    task: MiningTask,
+    *,
+    previous: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    from betalens.factor.mining_optuna import create_coarse_study, seed_study_with_results
+
+    n_trials = max(1, int(config.get("n_trials", 32)))
+    default_sampler = "tpe" if stage == "refine" else "qmc"
+    sampler = str(config.get("sampler", default_sampler)).lower()
+    batch_size = n_trials if sampler == "qmc" else max(1, int(config.get("batch_size", 8)))
+    study_config = dict(config)
+    study_config.setdefault("sampler", sampler)
+    study = create_coarse_study(study_config, direction=direction)
+    if sampler == "tpe" and previous is not None and not previous.empty:
+        seed_summary = _summary(previous, selection)
+        if not seed_summary.empty and "objective" in seed_summary:
+            seed_summary = seed_summary.dropna(subset=["objective"]).head(
+                max(1, int(config.get("bootstrap_top_k", 16)))
+            )
+        else:
+            seed_summary = pd.DataFrame()
+            _LOGGER.warning(
+                "TPE没有可导入的有效历史结果：因子=%s，前序候选全部无有效窗口；将从空study重新探索",
+                factor_id,
+            )
+        seed_candidates = [
+            {name: row[name] for name in parameter_specs}
+            for row in seed_summary.to_dict(orient="records")
+        ]
+        seeded = seed_study_with_results(
+            study,
+            parameter_specs,
+            seed_candidates,
+            [float(value) for value in seed_summary.get("objective", [])],
+        ) if not seed_summary.empty else 0
+        _LOGGER.info(
+            "TPE历史结果已导入：因子=%s，来源阶段候选=%d，作为先验的有效trial=%d",
+            factor_id, len(seed_summary), seeded,
+        )
+    stage_parts = []
+    for offset in range(0, n_trials, batch_size):
+        trials, candidates = _ask_candidates(
+            study,
+            parameter_specs,
+            min(batch_size, n_trials - offset),
+            complete_for_sampling=sampler == "qmc",
+        )
+        for value in candidates:
+            value.setdefault("factor_id", factor_id)
+        source = f"Optuna {sampler.upper()}"
+        task.store.append("search_progress", [{
+            "event": "planned",
+            "stage": stage,
+            "factor_id": factor_id,
+            "candidate_order": offset + index + 1,
+            "trial_number": getattr(trial, "number", offset + index),
+            "candidate_id": _candidate_id(factor_id, value),
+            "source": source,
+            "params_json": json.dumps(value, ensure_ascii=False, sort_keys=True, default=str),
+        } for index, (trial, value) in enumerate(zip(trials, candidates))])
+        known_parts = [value for value in [previous, *stage_parts] if value is not None and not value.empty]
+        known = pd.concat(known_parts, ignore_index=True) if known_parts else pd.DataFrame()
+        batch = _evaluate_with_reuse(
+            module,
+            factor_id,
+            candidates,
+            stage,
+            windows,
+            data,
+            evaluation,
+            runtime,
+            task,
+            previous=known,
+        )
+        if not batch.empty:
+            stage_parts.append(batch)
+        if sampler != "qmc":
+            score_parts = [value for value in [known, batch] if not value.empty]
+            score_frame = pd.concat(score_parts, ignore_index=True) if score_parts else pd.DataFrame()
+            score_summary = _summary(score_frame, selection)
+            _tell_candidates(study, trials, candidates, factor_id, score_summary)
+    frame = pd.concat(stage_parts, ignore_index=True) if stage_parts else pd.DataFrame()
+    summary = _summary(frame, selection)
+    records = _summary_records(summary, stage)
+    task.store.append("candidate_summary", records)
+    task.store.append("search_progress", [{"event": "summarized", **row} for row in records])
+    _LOGGER.info(
+        "%s筛选完成：因子=%s，采样器=%s，试验数=%d，去重候选=%d",
+        _stage_name(stage), factor_id, sampler.upper(), n_trials, len(summary),
+    )
+    return frame, summary
+
+
+def _top_parameter_rows(
+    summary: pd.DataFrame,
+    parameter_specs: Mapping[str, Mapping[str, Any]],
+    count: int,
+) -> list[dict[str, Any]]:
+    if summary.empty:
+        return []
+    selected = summary.loc[summary.selection_status == "selected"]
+    source = selected if not selected.empty else summary
+    return [
+        {name: row[name] for name in parameter_specs if name in row}
+        for row in source.head(max(1, int(count))).to_dict(orient="records")
+    ]
+
+
+def _stability_results(
+    selected: pd.DataFrame,
+    stability_summary: pd.DataFrame,
+    planned_by_parent: Mapping[str, int],
+    config: Mapping[str, Any],
+    direction: str,
+) -> pd.DataFrame:
+    if selected.empty:
+        return selected
+    output = selected.copy()
+    max_degradation = float(config.get("max_objective_degradation", 0.2))
+    required_ratio = float(config.get("required_pass_ratio", 0.7))
+    minimum_valid_ratio = float(config.get("minimum_valid_ratio", 0.8))
+    values = []
+    for row in output.to_dict(orient="records"):
+        candidate_id = str(row["candidate_id"])
+        planned = int(planned_by_parent.get(candidate_id, 0))
+        nearby = stability_summary.loc[
+            stability_summary.get(
+                "parent_candidate_id",
+                pd.Series(index=stability_summary.index, dtype=object),
+            ).astype(str) == candidate_id
+        ] if not stability_summary.empty else pd.DataFrame()
+        objectives = pd.to_numeric(nearby.get("objective", pd.Series(dtype=float)), errors="coerce").dropna()
+        winner_objective = float(row["objective"])
+        scale = max(abs(winner_objective), 1e-12)
+        if direction == "minimize":
+            degradations = (objectives - winner_objective) / scale
+        else:
+            degradations = (winner_objective - objectives) / scale
+        passed = degradations <= max_degradation
+        valid_ratio = len(objectives) / planned if planned else 0.0
+        pass_ratio = float(passed.mean()) if len(passed) else 0.0
+        stable = planned > 0 and valid_ratio >= minimum_valid_ratio and pass_ratio >= required_ratio
+        values.append({
+            "stability_status": "not_tested" if planned == 0 else ("stable" if stable else "unstable"),
+            "perturbation_count": planned,
+            "valid_perturbation_count": len(objectives),
+            "valid_perturbation_ratio": valid_ratio,
+            "perturbation_pass_ratio": pass_ratio,
+            "perturbed_objective_median": float(objectives.median()) if len(objectives) else np.nan,
+            "objective_degradation_median": float(degradations.median()) if len(degradations) else np.nan,
+        })
+    output = pd.concat([output.reset_index(drop=True), pd.DataFrame(values)], axis=1)
+    if bool(config.get("require_pass", False)):
+        output = output.loc[output.stability_status == "stable"].reset_index(drop=True)
+    return output
+
+
 def _run_factor(
     task: MiningTask,
     factor_id: str,
@@ -1602,9 +1918,11 @@ def _run_factor(
     windows: Sequence[MiningWindow],
 ) -> FactorMiningResult:
     from betalens.factor.mining_optuna import (
-        create_coarse_study,
         create_fine_grid_study,
+        detect_boundary_pressure,
+        expand_parameter_specs,
         generate_fine_candidates,
+        generate_perturbation_candidates,
     )
 
     started = time.perf_counter()
@@ -1619,7 +1937,12 @@ def _run_factor(
         number = int(str(factor_id).upper().replace("ALPHA", ""))
         parameter_specs.setdefault("alpha_id", {"type": "int", "low": number, "high": number, "step": 1})
     validate_parameter_specs(parameter_specs)
-    task.write_metadata(execution_mode=mode)
+    parameter_limits = dict(factor_config.get("parameter_limits") or {})
+    task.write_metadata(
+        execution_mode=mode,
+        resolved_parameter_specs=parameter_specs,
+        parameter_limits=parameter_limits,
+    )
     _LOGGER.info(
         "开始处理因子：因子=%s，模块=%s，执行模式=%s，待挖掘参数=%s，任务目录=%s",
         factor_id, module, _mode_name(mode), ",".join(parameter_specs), task.run_dir,
@@ -1642,47 +1965,118 @@ def _run_factor(
     direction = str((selection.get("objective") or {}).get("direction", "maximize")).lower()
     runtime = performance.get("runtime") or {}
     coarse_config = search.get("coarse") or {}
-    coarse_study = create_coarse_study(coarse_config, direction=direction)
-    coarse_trials, coarse_candidates = _ask_candidates(
-        coarse_study, parameter_specs, max(1, int(coarse_config.get("n_trials", 32))),
+    _LOGGER.info(
+        "开始宽范围搜索：因子=%s，采样器=%s，试验数=%d，参数边界=%s",
+        factor_id,
+        str(coarse_config.get("sampler", "qmc")).upper(),
+        max(1, int(coarse_config.get("n_trials", 32))),
+        json.dumps(parameter_specs, ensure_ascii=False, default=str),
     )
-    for value in coarse_candidates:
-        value.setdefault("factor_id", factor_id)
-    task.store.append("search_progress", [{
-        "event": "planned", "stage": "coarse", "factor_id": factor_id,
-        "candidate_order": index + 1, "trial_number": getattr(trial, "number", index),
-        "candidate_id": _candidate_id(str(factor_id), value), "source": "optuna",
-        "params_json": json.dumps(value, ensure_ascii=False, sort_keys=True, default=str),
-    } for index, (trial, value) in enumerate(zip(coarse_trials, coarse_candidates))])
-    _LOGGER.info("粗搜候选已生成：因子=%s，候选=%d，每个候选窗口=%d", factor_id, len(coarse_candidates), len(windows))
-    coarse = _evaluate_stage(
-        module, str(factor_id), coarse_candidates, "coarse", windows, data,
-        factor_evaluation, runtime, task,
+    coarse, coarse_summary = _run_sampled_stage(
+        module, str(factor_id), parameter_specs, coarse_config, "coarse", direction,
+        windows, data, factor_evaluation, runtime, selection, task,
     )
-    coarse_summary = _summary(coarse, selection)
-    coarse_records = _summary_records(coarse_summary, "coarse")
-    task.store.append("candidate_summary", coarse_records)
-    task.store.append("search_progress", [{"event": "summarized", **row} for row in coarse_records])
-    _tell_candidates(coarse_study, coarse_trials, coarse_candidates, str(factor_id), coarse_summary)
-    _LOGGER.info("粗搜筛选完成：因子=%s，汇总候选=%d", factor_id, len(coarse_summary))
+
+    stage_frames: dict[str, pd.DataFrame] = {"coarse": coarse}
+    stage_summaries: dict[str, pd.DataFrame] = {"coarse": coarse_summary}
+    broad_frames = [coarse] if not coarse.empty else []
+
+    refine_config = dict(search.get("refine") or {})
+    if refine_config and bool(refine_config.get("enabled", True)):
+        refine_config.setdefault("sampler", "tpe")
+        previous = pd.concat(broad_frames, ignore_index=True) if broad_frames else pd.DataFrame()
+        refine, refine_summary = _run_sampled_stage(
+            module, str(factor_id), parameter_specs, refine_config, "refine", direction,
+            windows, data, factor_evaluation, runtime, selection, task, previous=previous,
+        )
+        stage_frames["refine"] = refine
+        stage_summaries["refine"] = refine_summary
+        if not refine.empty:
+            broad_frames.append(refine)
+
+    def broad_results() -> pd.DataFrame:
+        if not broad_frames:
+            return pd.DataFrame()
+        value = pd.concat(broad_frames, ignore_index=True)
+        return value.drop_duplicates(["candidate_id", "window_id"], keep="last")
+
+    current_specs = {name: dict(spec) for name, spec in parameter_specs.items()}
+    broad = broad_results()
+    broad_summary = _summary(broad, selection)
+    expansion_config = dict(search.get("expansion") or {})
+    if expansion_config and bool(expansion_config.get("enabled", True)):
+        max_rounds = max(1, int(expansion_config.get("max_rounds", 1)))
+        boundary_top_k = max(1, int(expansion_config.get("boundary_top_k", 3)))
+        for round_number in range(1, max_rounds + 1):
+            winner_params = _top_parameter_rows(broad_summary, current_specs, boundary_top_k)
+            pressure = detect_boundary_pressure(
+                current_specs,
+                winner_params,
+                tolerance=float(expansion_config.get("boundary_tolerance", 0.1)),
+                winner_ratio=float(expansion_config.get("winner_ratio", 0.67)),
+            )
+            if not pressure:
+                _LOGGER.info("边界检查通过：因子=%s，优胜候选未持续集中在参数边界", factor_id)
+                break
+            expanded_specs = expand_parameter_specs(
+                current_specs,
+                pressure,
+                multiplier=float(expansion_config.get("range_multiplier", 3.0)),
+                limits=parameter_limits,
+            )
+            task.store.append("search_progress", [{
+                "event": "boundary_check",
+                "stage": f"expansion_{round_number}",
+                "factor_id": factor_id,
+                "source": "优胜候选触及边界，启动独立扩边study",
+                "boundary_pressure_json": json.dumps(pressure, ensure_ascii=False, default=str),
+                "previous_bounds_json": json.dumps(current_specs, ensure_ascii=False, default=str),
+                "expanded_bounds_json": json.dumps(expanded_specs, ensure_ascii=False, default=str),
+            }])
+            if expanded_specs == current_specs:
+                _LOGGER.info("边界扩展停止：因子=%s，参数已达到类型级硬边界", factor_id)
+                break
+            stage = f"expansion_{round_number}"
+            round_config = dict(expansion_config)
+            round_config.setdefault("sampler", "qmc")
+            round_config["seed"] = int(expansion_config.get("seed", coarse_config.get("seed", 20260818))) + round_number
+            _LOGGER.info(
+                "启动第%d轮独立边界扩展搜索：因子=%s，触边参数=%s，新边界=%s",
+                round_number, factor_id, ",".join(pressure),
+                json.dumps(expanded_specs, ensure_ascii=False, default=str),
+            )
+            expanded, expanded_summary = _run_sampled_stage(
+                module, str(factor_id), expanded_specs, round_config, stage, direction,
+                windows, data, factor_evaluation, runtime, selection, task, previous=broad,
+            )
+            stage_frames[stage] = expanded
+            stage_summaries[stage] = expanded_summary
+            if not expanded.empty:
+                broad_frames.append(expanded)
+            current_specs = expanded_specs
+            broad = broad_results()
+            broad_summary = _summary(broad, selection)
 
     fine_config = search.get("fine") or {}
-    anchors = []
-    if not coarse_summary.empty:
-        anchor_ids = coarse_summary.loc[
-            coarse_summary.selection_status == "selected", "candidate_id"
-        ].head(int(fine_config.get("top_k", 8)))
-        for candidate_id in anchor_ids:
-            row = coarse[coarse.candidate_id == candidate_id].iloc[0]
-            anchors.append({name: row[name] for name in parameter_specs})
+    anchors = _top_parameter_rows(
+        broad_summary,
+        current_specs,
+        int(fine_config.get("top_k", 8)),
+    )
+    broad_candidates = []
+    if not broad.empty:
+        broad_candidates = [
+            {name: row[name] for name in current_specs}
+            for row in broad.drop_duplicates("candidate_id").to_dict(orient="records")
+        ]
     fine_plan = generate_fine_candidates(
-        parameter_specs, anchors, fine_config, coarse_candidates=coarse_candidates,
+        current_specs, anchors, fine_config, coarse_candidates=broad_candidates,
     )
     fine_candidates = list(fine_plan.candidates)
     fine_trials = []
     fine_study = None
     if fine_candidates:
-        fine_space, fine_specs = _grid_specs(parameter_specs, fine_candidates)
+        fine_space, fine_specs = _grid_specs(current_specs, fine_candidates)
         fine_study = create_fine_grid_study(
             fine_space, direction=direction,
             seed=int(coarse_config.get("seed", 20260818)),
@@ -1701,37 +2095,19 @@ def _run_factor(
     task.store.append("search_progress", [{
         "event": "planned", "stage": "fine", "factor_id": factor_id,
         "candidate_order": index + 1, "trial_number": getattr(trial, "number", index),
-        "candidate_id": _candidate_id(str(factor_id), value), "source": "local_grid",
+        "candidate_id": _candidate_id(str(factor_id), value), "source": "局部网格",
         "params_json": json.dumps(value, ensure_ascii=False, sort_keys=True, default=str),
         **plan_details,
     } for index, (trial, value) in enumerate(zip(fine_trials, fine_candidates))])
 
-    coarse_ids = set(coarse.candidate_id) if not coarse.empty else set()
-    reused, pending = [], []
-    for value in fine_candidates:
-        candidate_id = _candidate_id(str(factor_id), value)
-        if candidate_id in coarse_ids:
-            rows = coarse.loc[coarse.candidate_id == candidate_id].copy()
-            rows["stage"] = "fine"
-            reused.append(rows)
-            task.store.append("window_results", rows.to_dict(orient="records"))
-            task.store.append("search_progress", [{
-                "event": "completed", "stage": "fine", "factor_id": factor_id,
-                "candidate_id": candidate_id, "source": "reused_from_coarse",
-                "params_json": json.dumps(value, ensure_ascii=False, sort_keys=True, default=str),
-            }])
-        else:
-            pending.append(value)
     _LOGGER.info(
-        "细搜候选已生成：因子=%s，候选总数=%d，复用粗搜结果=%d，待计算=%d",
-        factor_id, len(fine_candidates), len(reused), len(pending),
+        "局部网格已生成：因子=%s，锚点=%d，网格候选=%d",
+        factor_id, len(anchors), len(fine_candidates),
     )
-    evaluated = _evaluate_stage(
-        module, str(factor_id), pending, "fine", windows, data,
-        factor_evaluation, runtime, task,
+    fine = _evaluate_with_reuse(
+        module, str(factor_id), fine_candidates, "fine", windows, data,
+        factor_evaluation, runtime, task, previous=broad,
     )
-    fine_parts = [*reused, evaluated]
-    fine = pd.concat([value for value in fine_parts if not value.empty], ignore_index=True) if any(not value.empty for value in fine_parts) else pd.DataFrame()
     fine_summary = _summary(fine, selection)
     fine_records = _summary_records(fine_summary, "fine")
     task.store.append("candidate_summary", fine_records)
@@ -1745,7 +2121,76 @@ def _run_factor(
     )
     if fine_study is not None:
         _tell_candidates(fine_study, fine_trials, fine_candidates, str(factor_id), fine_summary)
-    selected = fine_summary[fine_summary.selection_status == "selected"].copy() if not fine_summary.empty else pd.DataFrame()
+    stage_frames["fine"] = fine
+    stage_summaries["fine"] = fine_summary
+    final_summary = fine_summary if not fine_summary.empty else broad_summary
+    selected = final_summary[final_summary.selection_status == "selected"].copy() if not final_summary.empty else pd.DataFrame()
+
+    stability = pd.DataFrame()
+    stability_summary = pd.DataFrame()
+    stability_config = dict(search.get("stability") or {})
+    if stability_config and bool(stability_config.get("enabled", True)) and not selected.empty:
+        stability_winners = selected.head(max(1, int(stability_config.get("top_k", 3)))).to_dict(orient="records")
+        perturbation_plan = generate_perturbation_candidates(
+            current_specs,
+            stability_winners,
+            perturbations_per_candidate=max(1, int(stability_config.get("perturbations_per_candidate", 8))),
+            radius_ratio=float(stability_config.get("radius_ratio", 0.1)),
+            seed=int(stability_config.get("seed", coarse_config.get("seed", 20260818))),
+        )
+        perturbations, perturbation_metadata = [], {}
+        planned_by_parent: dict[str, int] = {}
+        for value in perturbation_plan.candidates:
+            token = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+            metadata = dict(perturbation_plan.metadata[token])
+            candidate = dict(value)
+            candidate.setdefault("factor_id", factor_id)
+            candidate_id = _candidate_id(str(factor_id), candidate)
+            perturbations.append(candidate)
+            perturbation_metadata[candidate_id] = metadata
+            parent_id = str(metadata["parent_candidate_id"])
+            planned_by_parent[parent_id] = planned_by_parent.get(parent_id, 0) + 1
+        task.store.append("search_progress", [{
+            "event": "planned",
+            "stage": "stability",
+            "factor_id": factor_id,
+            "candidate_order": index + 1,
+            "candidate_id": _candidate_id(str(factor_id), value),
+            "source": "赢家邻域随机扰动",
+            "params_json": json.dumps(value, ensure_ascii=False, sort_keys=True, default=str),
+            **perturbation_metadata.get(_candidate_id(str(factor_id), value), {}),
+        } for index, value in enumerate(perturbations)])
+        previous_parts = [value for value in [broad, fine] if not value.empty]
+        previous = pd.concat(previous_parts, ignore_index=True) if previous_parts else pd.DataFrame()
+        _LOGGER.info(
+            "开始赢家扰动验证：因子=%s，赢家数=%d，扰动候选=%d，扰动半径=%.1f%%",
+            factor_id, len(stability_winners), len(perturbations),
+            float(stability_config.get("radius_ratio", 0.1)) * 100,
+        )
+        stability = _evaluate_with_reuse(
+            module, str(factor_id), perturbations, "stability", windows, data,
+            factor_evaluation, runtime, task, previous=previous,
+            candidate_metadata=perturbation_metadata,
+        )
+        stability_summary = _summary(stability, selection)
+        stability_records = _summary_records(stability_summary, "stability")
+        task.store.append("candidate_summary", stability_records)
+        task.store.append("search_progress", [{"event": "summarized", **row} for row in stability_records])
+        selected = _stability_results(
+            selected,
+            stability_summary,
+            planned_by_parent,
+            stability_config,
+            direction,
+        )
+        stage_frames["stability"] = stability
+        stage_summaries["stability"] = stability_summary
+        stable_count = int((selected.get("stability_status") == "stable").sum()) if not selected.empty else 0
+        _LOGGER.info(
+            "赢家扰动验证完成：因子=%s，通过稳定性验证=%d/%d，是否强制通过=%s",
+            factor_id, stable_count, len(stability_winners),
+            _yes_no(stability_config.get("require_pass", False)),
+        )
     winner_records = []
     for rank, row in enumerate(selected.to_dict(orient="records"), 1):
         winner_records.append({"rank": rank, **row})
@@ -1753,11 +2198,14 @@ def _run_factor(
     result = FactorMiningResult(
         factor_id=str(factor_id), run_id=task.run_id, run_dir=task.run_dir, status="complete",
         coarse_window_results=coarse, coarse_summary=coarse_summary,
-        fine_window_results=fine, fine_summary=fine_summary, selected_candidates=selected,
+        fine_window_results=fine, fine_summary=fine_summary,
+        stability_window_results=stability, stability_summary=stability_summary,
+        stage_window_results=stage_frames, stage_summaries=stage_summaries,
+        selected_candidates=selected,
     )
     _LOGGER.info(
-        "因子挖掘完成：因子=%s，粗搜候选=%d，细搜候选=%d，最终入选=%d，耗时=%s",
-        factor_id, len(coarse_summary), len(fine_summary), len(selected), _elapsed(started),
+        "因子挖掘完成：因子=%s，宽搜候选=%d，细搜候选=%d，最终入选=%d，耗时=%s",
+        factor_id, len(broad_summary), len(fine_summary), len(selected), _elapsed(started),
     )
     return result
 
@@ -1781,6 +2229,42 @@ def _validate_performance_config(performance: Mapping[str, Any]) -> None:
         raise ValueError("cache.data_enabled must be boolean")
 
 
+def _validate_search_config(parameters: Mapping[str, Any]) -> None:
+    search = parameters.get("search") or {}
+    for stage in ("coarse", "refine", "expansion"):
+        config = search.get(stage) or {}
+        if not config:
+            continue
+        sampler = str(config.get("sampler", "qmc" if stage != "refine" else "tpe")).lower()
+        if sampler not in {"qmc", "random", "tpe"}:
+            raise ValueError(f"search.{stage}.sampler must be qmc, random or tpe")
+        if int(config.get("n_trials", 32)) < 1:
+            raise ValueError(f"search.{stage}.n_trials must be positive")
+        if sampler == "qmc" and str(config.get("qmc_type", "sobol")).lower() not in {"sobol", "halton"}:
+            raise ValueError(f"search.{stage}.qmc_type must be sobol or halton")
+    expansion = search.get("expansion") or {}
+    if expansion:
+        if float(expansion.get("range_multiplier", 3)) <= 1:
+            raise ValueError("search.expansion.range_multiplier must be > 1")
+        if not 0 <= float(expansion.get("boundary_tolerance", 0.1)) < 0.5:
+            raise ValueError("search.expansion.boundary_tolerance must be in [0, 0.5)")
+        if not 0 < float(expansion.get("winner_ratio", 0.67)) <= 1:
+            raise ValueError("search.expansion.winner_ratio must be in (0, 1]")
+    stability = search.get("stability") or {}
+    if stability:
+        ratios = {
+            "radius_ratio": (0, 0.5),
+            "required_pass_ratio": (0, 1),
+            "minimum_valid_ratio": (0, 1),
+        }
+        for name, (low, high) in ratios.items():
+            value = float(stability.get(name, 0.1 if name == "radius_ratio" else 0.7))
+            if not low < value <= high:
+                raise ValueError(f"search.stability.{name} must be in ({low}, {high}]")
+        if float(stability.get("max_objective_degradation", 0.2)) < 0:
+            raise ValueError("search.stability.max_objective_degradation must be >= 0")
+
+
 def run_mining(parameter_config_path: str | Path, performance_config_path: str | Path) -> MiningResult:
     """Run one isolated mining task per factor and return the launch result."""
     parameter_path = Path(parameter_config_path).resolve()
@@ -1791,6 +2275,7 @@ def run_mining(parameter_config_path: str | Path, performance_config_path: str |
     parameters_config = _load_yaml(parameter_path)
     performance = _load_yaml(performance_path)
     _validate_performance_config(performance)
+    _validate_search_config(parameters_config)
     try:
         import optuna
 
@@ -1800,11 +2285,11 @@ def run_mining(parameter_config_path: str | Path, performance_config_path: str |
     if int(parameters_config.get("version", 1)) != 1:
         raise ValueError(f"unsupported mining parameter_space version: {parameters_config.get('version')}")
     factors = parameters_config.get("factors") or {}
-    if factors == "all":
-        if str(parameters_config.get("factor_class", "")).lower() != "alpha101":
-            raise ValueError("factors: all is currently supported only for alpha101")
-        factors = _all_alpha_configs()
-    if isinstance(factors, list):
+    if factors == "all" and str(parameters_config.get("factor_class", "")).lower() != "alpha101":
+        raise ValueError("factors: all is currently supported only for alpha101")
+    if str(parameters_config.get("factor_class", "")).lower() == "alpha101":
+        factors = _resolve_alpha_configs(parameters_config, factors)
+    elif isinstance(factors, list):
         factors = {str(value["id"]): value for value in factors}
     if not isinstance(factors, Mapping) or not factors:
         raise ValueError("factors must be a non-empty mapping or `all`")
@@ -1834,6 +2319,7 @@ def run_mining(parameter_config_path: str | Path, performance_config_path: str |
     if heartbeat_seconds < 0:
         raise ValueError("logging.heartbeat_seconds must be >= 0")
     factor_runs = []
+    resolved_parameters_config = {**parameters_config, "factors": factors}
     for factor_id, factor_config in factors.items():
         if not isinstance(factor_config, Mapping):
             raise TypeError(f"factor {factor_id} configuration must be a mapping")
@@ -1842,7 +2328,7 @@ def run_mining(parameter_config_path: str | Path, performance_config_path: str |
             factor_class=parameters_config.get("factor_class"),
             parameter_path=parameter_path,
             performance_path=performance_path,
-            config={"parameter_space": parameters_config, "performance": performance},
+            config={"parameter_space": resolved_parameters_config, "performance": performance},
         )
         _configure_mining_logging(
             task.log_path, levels[level_name],
@@ -1855,7 +2341,7 @@ def run_mining(parameter_config_path: str | Path, performance_config_path: str |
                 launch_id, task.run_id, factor_id, task.run_dir,
             )
             result = _run_factor(
-                task, str(factor_id), factor_config, parameters_config,
+                task, str(factor_id), factor_config, resolved_parameters_config,
                 performance, evaluation, windows,
             )
             task.finish(result, status="complete", windows={"lengths": lengths, "steps": steps, "count": len(windows)})

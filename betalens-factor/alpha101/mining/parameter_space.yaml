@@ -6,27 +6,33 @@ factor_class: alpha101
 # factors 有两种写法：
 # 1. 像下面一样显式列出一个或多个 Alpha；
 # 2. 将整个 factors 映射替换为 `factors: all`，自动生成 ALPHA1 至 ALPHA101。
-# `all` 使用 alpha101_parameters.py 的启发式规则，默认最多放开每个公式前三个
+# `all` 使用 alpha101_parameters.py 的启发式规则，默认最多放开每个公式前五个
 # 可搜索参数；显式配置不会调用自动空间生成逻辑。
-factors:
-  ALPHA3:
-    # 可导入且提供 make_mining_spec(params) 的 Python 模块。
-    module: alpha101_mining
-    # 可选：precomputed | rolling_fit。Alpha101 使用 precomputed。
-    execution_mode: precomputed
-    parameters:
-      # ALPHA3 论文默认窗口为 10。自动规则以 [5, 10, 20] 推导出 5..20 边界；
-      # 这些不是三个离散候选，粗搜可以采样区间内任意合法整数。
-      rank_open_rank_volume_correlation_window:
-        # 可选：int | float | categorical | bool。
-        type: int
-        # 数值参数的闭区间边界；log 尺度要求 low > 0。
-        low: 5
-        high: 20
-        # 可选：linear | log。窗口和 lag 通常使用 log。
-        scale: log
-        # 正整数步长；log 整数参数必须为 1。
-        step: 1
+# 显式因子也可像 ALPHA3 一样写 `parameters: auto`，只自动生成该因子的参数空间。
+factors: all
+
+#  ALPHA3:
+#    # 可导入且提供 make_mining_spec(params) 的 Python 模块。
+#    module: alpha101_mining
+#    # 可选：precomputed | rolling_fit。Alpha101 使用 precomputed。
+#    execution_mode: precomputed
+#    # 可选：auto | 显式参数映射。auto 使用下方的 Alpha101 自动生成配置。
+#    # ALPHA3 默认窗口为 10，在当前十倍跨度下自动生成 1..100 的 log 空间。
+#    parameters: auto
+
+# 仅用于 `factors: all` 或 `parameters: auto`。
+alpha101_parameter_generation:
+  # 相对论文默认值 d 的搜索跨度 m；窗口约为 [d/m, d*m]，必须 > 1。
+  range_multiplier: 10
+  # 按公式签名顺序最多放开的可搜索维数，正整数；其余参数固定为论文默认值。
+  max_dimensions: 5
+  # 类型级硬边界：自动初始边界和后续自动扩边都不得突破这些范围。
+  type_limits:
+    window: {low: 1, high: 1260}
+    lag: {low: 1, high: 504}
+    weight: {low: 0.0, high: 1.0}
+    threshold: {low: -10.0, high: 10.0}
+    exponent: {low: 0.01, high: 100.0}
 
 evaluation:
   # 评分区间 [开始日期, 结束日期]，格式 YYYY-MM-DD。
@@ -42,18 +48,51 @@ evaluation:
 
 windows:
   # 评分窗口长度，单位为交易日，可配置多个正整数。
-  lengths: [252, 504]
+  lengths: [252, 504, 756]
   # 窗口滑动步长，单位为交易日；每个 step 必须 <= 每个 length。
-  steps: [21, 63]
+  steps: [21, 42, 63]
 
 search:
   coarse:
-    # 可选：random | tpe。
-    sampler: random
-    # 粗搜试验数，正整数；重复参数会由候选 ID 去重。
-    n_trials: 64
+    # 可选：qmc | random | tpe。宽搜推荐 qmc。
+    sampler: qmc
+    # QMC 序列可选：sobol | halton；Sobol 的试验数宜使用 2 的幂。
+    qmc_type: sobol
+    # 是否随机扰乱低差异序列；true 在保持覆盖性的同时受 seed 控制。
+    scramble: true
+    # 宽搜试验数，正整数；重复参数会由候选 ID 去重。
+    n_trials: 128
     # 固定随机种子，保证候选生成可复现。
     seed: 20260818
+  refine:
+    # 可选：true | false。QMC 宽搜后使用独立 TPE study 自适应收敛。
+    enabled: true
+    sampler: tpe
+    # TPE 总试验数及每轮完成后反馈给 study 的批大小，均为正整数。
+    n_trials: 48
+    batch_size: 8
+    # TPE 在开始模型采样前的随机试验数，正整数。
+    n_startup_trials: 8
+    # 从前序宽搜中导入目标值最好的多少个 completed trial 作为 TPE 先验。
+    bootstrap_top_k: 16
+    seed: 20260819
+  expansion:
+    # 可选：true | false。优胜候选持续靠近同一边界时启动新的 QMC study。
+    enabled: true
+    sampler: qmc
+    qmc_type: sobol
+    n_trials: 64
+    # 最多扩边轮数；每轮都是新 study，不会动态修改已有 study 的分布。
+    max_rounds: 2
+    # 检查排名靠前的候选数。
+    boundary_top_k: 3
+    # 归一化参数轴两端各 10% 视为靠近边界，范围 [0, 0.5)。
+    boundary_tolerance: 0.10
+    # 至少 67% 的优胜候选靠近同一侧才扩边，范围 (0, 1]。
+    winner_ratio: 0.67
+    # 每次向触边侧扩大 3 倍，但不会突破类型级硬边界。
+    range_multiplier: 3
+    seed: 20260820
   fine:
     # 取粗搜排名靠前的多少个入选候选作为局部网格锚点。
     top_k: 8
@@ -61,6 +100,22 @@ search:
     points_per_dimension: 7
     # 细搜候选总上限，防止多参数笛卡尔积失控。
     max_candidates: 256
+  stability:
+    # 可选：true | false。对最终赢家附近施加随机参数误差，验证局部稳定性。
+    enabled: true
+    # 验证前多少名赢家，以及每名赢家生成多少个扰动候选。
+    top_k: 3
+    perturbations_per_candidate: 8
+    # 扰动半径占全局参数跨度的比例，范围 (0, 0.5]；log 参数在对数轴扰动。
+    radius_ratio: 0.10
+    # 单个扰动相对赢家允许的目标值退化上限，0.20 表示最多退化 20%。
+    max_objective_degradation: 0.20
+    # 至少 70% 的有效扰动满足退化上限，且至少 80% 的扰动有效，才判为稳定。
+    required_pass_ratio: 0.70
+    minimum_valid_ratio: 0.80
+    # false 仅审计标注稳定性；true 会从最终赢家中剔除不稳定候选。
+    require_pass: false
+    seed: 20260821
 
 selection:
   objective:

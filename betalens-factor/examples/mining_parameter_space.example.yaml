@@ -50,12 +50,38 @@ windows:
 
 search:
   coarse:
-    # 可选：random | tpe。
-    sampler: random
+    # 可选：qmc | random | tpe。跨数量级宽搜推荐 qmc。
+    sampler: qmc
+    # QMC 可选：sobol | halton；仅 sampler=qmc 时生效。
+    qmc_type: sobol
+    scramble: true
     # 粗搜试验数，正整数；重复参数会由候选 ID 去重。
     n_trials: 64
     # Optuna 随机种子；固定后候选生成可复现。
     seed: 20260818
+  refine:
+    # 可选环节；enabled=false 或删除本段可关闭。推荐用 TPE 做宽搜后的收敛。
+    enabled: true
+    sampler: tpe
+    n_trials: 32
+    # TPE 每批完成后回传目标值，再生成下一批候选。
+    batch_size: 8
+    n_startup_trials: 8
+    # 将前序宽搜最优的 completed trial 导入新 TPE study。
+    bootstrap_top_k: 16
+    seed: 20260819
+  expansion:
+    # 优胜点持续触边时，用扩大后的新分布启动独立 study。
+    enabled: true
+    sampler: qmc
+    qmc_type: sobol
+    n_trials: 32
+    max_rounds: 2
+    boundary_top_k: 3
+    boundary_tolerance: 0.10
+    winner_ratio: 0.67
+    range_multiplier: 3
+    seed: 20260820
   fine:
     # 用于生成局部网格的粗搜优胜锚点数，正整数。
     top_k: 8
@@ -63,6 +89,18 @@ search:
     points_per_dimension: 7
     # 细搜候选总上限，正整数；用于限制笛卡尔积规模。
     max_candidates: 256
+  stability:
+    # 在赢家邻域随机扰动数值参数；categorical/bool 保持赢家取值。
+    enabled: true
+    top_k: 3
+    perturbations_per_candidate: 8
+    radius_ratio: 0.10
+    max_objective_degradation: 0.20
+    required_pass_ratio: 0.70
+    minimum_valid_ratio: 0.80
+    # false 只给出稳定/不稳定结论；true 要求赢家必须通过验证。
+    require_pass: false
+    seed: 20260821
 
 selection:
   objective:

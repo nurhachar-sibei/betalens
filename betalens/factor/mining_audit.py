@@ -142,6 +142,13 @@ _COLUMN_NAMES = {
     "sharpe_median": "夏普中位数", "rank": "排名", "selection_status": "筛选状态",
     "selection_reason": "筛选说明", "objective": "目标值", "valid_window_ratio": "有效窗口比例",
     "valid_window_count": "有效窗口数", "window_count": "窗口总数", "max_mdd": "最大回撤",
+    "boundary_pressure_json": "边界压力", "previous_bounds_json": "扩展前边界",
+    "expanded_bounds_json": "扩展后边界", "parent_candidate_id": "所属赢家候选",
+    "winner_rank": "赢家排名", "perturbation_index": "扰动序号",
+    "stability_status": "稳定性结论", "perturbation_count": "计划扰动数",
+    "valid_perturbation_count": "有效扰动数", "valid_perturbation_ratio": "有效扰动比例",
+    "perturbation_pass_ratio": "扰动通过比例", "perturbed_objective_median": "扰动目标中位数",
+    "objective_degradation_median": "目标退化中位数",
 }
 
 
@@ -163,7 +170,40 @@ def _humanize_columns(frame: pd.DataFrame) -> pd.DataFrame:
                     translated = f"{metric_names.get(metric, metric)}{suffix_name}"
                     break
         names[column] = translated or str(column)
-    return frame.rename(columns=names)
+    output = frame.rename(columns=names)
+    value_mappings = {
+        "搜索阶段": {
+            "coarse": "宽范围粗搜",
+            "refine": "自适应收敛搜索",
+            "fine": "局部网格细搜",
+            "stability": "赢家扰动验证",
+        },
+        "记录类型": {
+            "planned": "已规划",
+            "completed": "已完成",
+            "summarized": "已汇总",
+            "boundary_check": "边界检查",
+        },
+        "筛选状态": {
+            "selected": "已入选",
+            "filtered": "被过滤",
+            "candidate": "候选",
+        },
+        "稳定性结论": {
+            "stable": "稳定",
+            "unstable": "不稳定",
+            "not_tested": "未验证",
+        },
+    }
+    for column, mapping in value_mappings.items():
+        if column in output:
+            output[column] = output[column].replace(mapping)
+    if "搜索阶段" in output:
+        output["搜索阶段"] = output["搜索阶段"].map(
+            lambda value: f"第{str(value).rsplit('_', 1)[-1]}轮边界扩展搜索"
+            if str(value).startswith("expansion_") else value
+        )
+    return output
 
 
 def _write_sheet(writer: pd.ExcelWriter, name: str, frame: pd.DataFrame, *, max_rows: int = 1_000_000) -> None:
@@ -212,6 +252,10 @@ class FactorMiningResult:
     coarse_summary: pd.DataFrame = field(default_factory=pd.DataFrame)
     fine_window_results: pd.DataFrame = field(default_factory=pd.DataFrame)
     fine_summary: pd.DataFrame = field(default_factory=pd.DataFrame)
+    stability_window_results: pd.DataFrame = field(default_factory=pd.DataFrame)
+    stability_summary: pd.DataFrame = field(default_factory=pd.DataFrame)
+    stage_window_results: dict[str, pd.DataFrame] = field(default_factory=dict)
+    stage_summaries: dict[str, pd.DataFrame] = field(default_factory=dict)
     selected_candidates: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
@@ -332,19 +376,28 @@ class MiningTask:
             for name, spec in (factor.get("parameters") or {}).items():
                 row = {"因子": factor_id, "参数": name, **dict(spec)}
                 parameter_rows.append(row)
+        if not parameter_rows:
+            for name, spec in (self.metadata.get("resolved_parameter_specs") or {}).items():
+                parameter_rows.append({"因子": self.factor_id, "参数": name, **dict(spec)})
         progress = self.store.read("search_progress")
         windows = self.store.read("window_results")
         summaries = self.store.read("candidate_summary")
         winners = self.store.read("winners")
         errors = self.store.read("errors")
-        if not summaries.empty and not winners.empty and "candidate_id" in winners and "candidate_id" in summaries:
-            winner_ids = set(winners["candidate_id"].astype(str))
-            winner_summaries = summaries[
-                summaries["candidate_id"].astype(str).isin(winner_ids)
-                & summaries.get("stage", pd.Series(index=summaries.index, dtype=object)).eq("fine")
-            ]
-        else:
-            winner_summaries = pd.DataFrame()
+        stability_details = summaries.loc[
+            summaries.get("stage", pd.Series(index=summaries.index, dtype=object)).eq("stability")
+        ] if not summaries.empty else pd.DataFrame()
+        winner_summaries = winners.copy()
+        stability_parts = []
+        if not winners.empty and "stability_status" in winners:
+            conclusions = winners.copy()
+            conclusions.insert(0, "record_kind", "赢家结论")
+            stability_parts.append(conclusions)
+        if not stability_details.empty:
+            details = stability_details.copy()
+            details.insert(0, "record_kind", "扰动候选")
+            stability_parts.append(details)
+        stability = pd.concat(stability_parts, ignore_index=True, sort=False) if stability_parts else pd.DataFrame()
         winner_parameter_columns = [
             name for name in ("rank", "factor_id", "candidate_id", "params_json", "objective")
             if name in winners
@@ -372,6 +425,7 @@ class MiningTask:
             _write_sheet(writer, "候选汇总", _humanize_columns(summaries))
             _write_sheet(writer, "赢家参数", _humanize_columns(winner_parameters))
             _write_sheet(writer, "赢家汇总", _humanize_columns(winner_summaries))
+            _write_sheet(writer, "稳定性验证", _humanize_columns(stability))
             _write_sheet(writer, "错误", _humanize_columns(errors))
         _style_workbook(temporary)
         os.replace(temporary, self.workbook_path)
@@ -384,6 +438,14 @@ class MiningTask:
         errors = self.store.read("errors")
         window_stages = windows.get("stage", pd.Series(index=windows.index, dtype=object))
         summary_stages = summaries.get("stage", pd.Series(index=summaries.index, dtype=object))
+        stage_window_rows = {
+            str(stage): int(count)
+            for stage, count in window_stages.value_counts().to_dict().items()
+        }
+        stage_candidates = {
+            str(stage): int(count)
+            for stage, count in summary_stages.value_counts().to_dict().items()
+        }
         self.write_metadata(
             status=status,
             completed_at_local=datetime.now().astimezone().isoformat(),
@@ -395,6 +457,8 @@ class MiningTask:
                 "fine_candidates": int(summary_stages.eq("fine").sum()),
                 "selected_candidates": len(winners),
                 "errors": len(errors),
+                "stage_window_rows": stage_window_rows,
+                "stage_candidates": stage_candidates,
             },
             winners=winners.to_dict(orient="records"),
             **updates,

@@ -2,19 +2,21 @@
 
 参数元数据来自 :mod:`alpha101_formulas` 中每个 ``alphaN`` 函数的关键字默认值。
 自动参数空间是围绕论文默认值生成的启发式范围，不读取历史数据，也不根据回测
-结果反推全局边界。默认最多放开公式签名中靠前的三个可搜索参数；其余参数仍会
+结果反推全局边界。默认最多放开公式签名中靠前的五个可搜索参数；其余参数仍会
 进入配置，但 ``low == high == default``。
 
 边界规则：
 
-* ``window`` / ``lag``：约 ``[0.5d, d, 2d]``，最小值为 1；
-* ``weight``：``[max(0, 0.5d), d, min(1, 1.5d)]``；
-* ``threshold``：``d +/- max(0.5 * abs(d), 0.05)``；
-* ``exponent``：``[0.5d, d, 2d]``；
+* ``window`` / ``lag``：``[d / m, d, d * m]``，最小值为 1；
+* ``weight``：默认搜索类型上限定义的完整区间 ``[0, 1]``；
+* ``threshold``：``d +/- max(abs(d), 0.05) * m``；
+* ``exponent``：保持默认值符号，按 ``[abs(d) / m, abs(d) * m]`` 扩展；
 * 其他种类固定为论文默认值 ``d``。
 
 参考点最终只用于推导 ``low`` / ``high``。粗搜会在完整边界内采样，而不是只在
-三个参考点上取值；``window`` / ``lag`` 使用对数尺度，其他参数使用线性尺度。
+三个参考点上取值；``m`` 为 ``range_multiplier``，默认 10。类型级上下限作为硬
+约束，防止窗口、滞后和指数等参数无限扩展。``window`` / ``lag`` 及同号非零
+``exponent`` 使用对数尺度，其他参数使用线性尺度。
 """
 from __future__ import annotations
 
@@ -24,6 +26,17 @@ import math
 from typing import Any, Mapping, Sequence
 
 from alpha101_formulas import AlphaParameter, default_compute_kwargs, get_definition
+
+
+DEFAULT_RANGE_MULTIPLIER = 10.0
+DEFAULT_MAX_DIMENSIONS = 5
+DEFAULT_TYPE_LIMITS: dict[str, dict[str, float]] = {
+    "window": {"low": 1.0, "high": 1260.0},
+    "lag": {"low": 1.0, "high": 504.0},
+    "weight": {"low": 0.0, "high": 1.0},
+    "threshold": {"low": -10.0, "high": 10.0},
+    "exponent": {"low": 0.01, "high": 100.0},
+}
 
 
 def parameter_catalog(alpha_id: str | int) -> dict[str, AlphaParameter]:
@@ -39,30 +52,83 @@ def _unique(values: Sequence[int | float]) -> list[int | float]:
     return output
 
 
-def candidate_values(spec: AlphaParameter) -> list[int | float]:
-    """按参数种类返回论文默认值附近、用于推导边界的参考点。"""
+def _type_limits(
+    kind: str,
+    overrides: Mapping[str, Mapping[str, Any]] | None,
+) -> dict[str, float] | None:
+    values = dict(DEFAULT_TYPE_LIMITS.get(kind, {}))
+    values.update(dict((overrides or {}).get(kind, {})))
+    if not values:
+        return None
+    low, high = float(values["low"]), float(values["high"])
+    if not math.isfinite(low) or not math.isfinite(high) or low > high:
+        raise ValueError(f"invalid Alpha101 type limits for {kind}: low must be <= high")
+    return {"low": low, "high": high}
+
+
+def _clamp_reference_points(
+    values: Sequence[int | float],
+    default: int | float,
+    limits: Mapping[str, float] | None,
+    *,
+    integer: bool = False,
+) -> list[int | float]:
+    if limits is None:
+        return _unique(values)
+    low, high = float(limits["low"]), float(limits["high"])
+    if not low <= float(default) <= high:
+        raise ValueError(f"Alpha101 default {default} is outside configured type limits [{low}, {high}]")
+    clamped = [max(low, min(high, float(value))) for value in values]
+    if integer:
+        clamped = [int(round(value)) for value in clamped]
+    return _unique(clamped)
+
+
+def candidate_values(
+    spec: AlphaParameter,
+    *,
+    range_multiplier: float = DEFAULT_RANGE_MULTIPLIER,
+    type_limits: Mapping[str, Mapping[str, Any]] | None = None,
+) -> list[int | float]:
+    """按参数种类返回宽范围参考点，并应用类型级硬边界。"""
+    multiplier = float(range_multiplier)
+    if not math.isfinite(multiplier) or multiplier <= 1:
+        raise ValueError("range_multiplier must be finite and > 1")
     default = spec.default
+    limits = _type_limits(spec.kind, type_limits)
     if spec.kind in {"window", "lag"}:
         if isinstance(default, float):
             center = float(default)
-            return _unique([max(1.0, center * 0.5), center, max(1.0, center * 2.0)])
+            values = [max(1.0, center / multiplier), center, max(1.0, center * multiplier)]
+            return _clamp_reference_points(values, default, limits)
         center = max(1, int(default))
-        return _unique([max(1, int(math.floor(center * 0.5 + 0.5))), center, max(1, center * 2)])
+        values = [max(1, int(round(center / multiplier))), center, max(1, int(round(center * multiplier)))]
+        return _clamp_reference_points(values, default, limits, integer=True)
     if spec.kind == "weight":
         center = float(default)
-        return _unique([max(0.0, center * 0.5), center, min(1.0, center * 1.5)])
+        values = [limits["low"], center, limits["high"]] if limits else [0.0, center, 1.0]
+        return _clamp_reference_points(values, default, limits)
     if spec.kind == "threshold":
         center = float(default)
-        spread = max(abs(center) * 0.5, 0.05)
-        return _unique([center - spread, center, center + spread])
+        spread = max(abs(center), 0.05) * multiplier
+        return _clamp_reference_points([center - spread, center, center + spread], default, limits)
     if spec.kind == "exponent":
         center = float(default)
-        return _unique([center * 0.5, center, center * 2.0])
+        sign = -1.0 if center < 0 else 1.0
+        magnitude = max(abs(center), 0.01)
+        values = [sign * magnitude / multiplier, center, sign * magnitude * multiplier]
+        return _clamp_reference_points(values, default, limits)
     return [default]
 
 
-def default_search_space(alpha_id: str | int, max_dimensions: int = 3) -> dict[str, list[int | float]]:
-    """按公式参数顺序放开至多 ``max_dimensions`` 个可搜索参数。"""
+def default_search_space(
+    alpha_id: str | int,
+    max_dimensions: int = DEFAULT_MAX_DIMENSIONS,
+    *,
+    range_multiplier: float = DEFAULT_RANGE_MULTIPLIER,
+    type_limits: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, list[int | float]]:
+    """按公式参数顺序放开至多 ``max_dimensions`` 个可搜索参数并扩展边界。"""
     if int(max_dimensions) < 0:
         raise ValueError("max_dimensions must be >= 0")
     remaining = int(max_dimensions)
@@ -70,7 +136,11 @@ def default_search_space(alpha_id: str | int, max_dimensions: int = 3) -> dict[s
     for name, spec in parameter_catalog(alpha_id).items():
         values = [spec.default]
         if spec.searchable and remaining > 0:
-            proposed = candidate_values(spec)
+            proposed = candidate_values(
+                spec,
+                range_multiplier=range_multiplier,
+                type_limits=type_limits,
+            )
             if len(proposed) > 1:
                 values = proposed
                 remaining -= 1
@@ -78,13 +148,24 @@ def default_search_space(alpha_id: str | int, max_dimensions: int = 3) -> dict[s
     return search_space
 
 
-def mining_parameter_specs(alpha_id: str | int, max_dimensions: int = 3) -> dict[str, dict[str, Any]]:
-    """将参考点转换为 mining 使用的类型、边界、步长和尺度定义。
+def mining_parameter_specs(
+    alpha_id: str | int,
+    max_dimensions: int = DEFAULT_MAX_DIMENSIONS,
+    *,
+    range_multiplier: float = DEFAULT_RANGE_MULTIPLIER,
+    type_limits: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """将宽范围参考点转换为 mining 使用的类型、边界、步长和尺度定义。
 
     整数参数使用 ``step=1``；窗口和滞后参数使用 ``scale=log``，其余参数使用
     ``scale=linear``。参考点本身不会作为 categorical 候选保留下来。
     """
-    values_by_name = default_search_space(alpha_id, max_dimensions=max_dimensions)
+    values_by_name = default_search_space(
+        alpha_id,
+        max_dimensions=max_dimensions,
+        range_multiplier=range_multiplier,
+        type_limits=type_limits,
+    )
     output = {}
     for name, values in values_by_name.items():
         catalog = parameter_catalog(alpha_id)[name]
@@ -93,7 +174,7 @@ def mining_parameter_specs(alpha_id: str | int, max_dimensions: int = 3) -> dict
             "type": "float" if is_float else "int",
             "low": min(values),
             "high": max(values),
-            "scale": "log" if catalog.kind in {"window", "lag"} else "linear",
+            "scale": "log" if catalog.kind in {"window", "lag", "exponent"} and min(values) > 0 else "linear",
         }
         if not is_float:
             spec["step"] = 1
@@ -129,13 +210,38 @@ def mining_optuna_distributions(
     return {name: to_optuna_distribution(spec) for name, spec in validated.items()}
 
 
-def aggregate_mining_factors() -> dict[str, dict[str, Any]]:
+def mining_parameter_limits(
+    alpha_id: str | int,
+    *,
+    type_limits: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, dict[str, float]]:
+    """返回每个可搜索公式参数在自动扩边阶段不可突破的硬边界。"""
+    output = {}
+    for name, spec in parameter_catalog(alpha_id).items():
+        limits = _type_limits(spec.kind, type_limits)
+        if spec.searchable and limits is not None:
+            output[name] = limits
+    return output
+
+
+def aggregate_mining_factors(
+    *,
+    range_multiplier: float = DEFAULT_RANGE_MULTIPLIER,
+    max_dimensions: int = DEFAULT_MAX_DIMENSIONS,
+    type_limits: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, dict[str, Any]]:
     """将 ``factors: all`` 展开为 ALPHA1 至 ALPHA101 的自动参数空间。"""
     return {
         get_definition(number).name: {
             "module": "alpha101_mining",
             "execution_mode": "precomputed",
-            "parameters": mining_parameter_specs(number),
+            "parameters": mining_parameter_specs(
+                number,
+                max_dimensions=max_dimensions,
+                range_multiplier=range_multiplier,
+                type_limits=type_limits,
+            ),
+            "parameter_limits": mining_parameter_limits(number, type_limits=type_limits),
         }
         for number in range(1, 102)
     }
@@ -241,6 +347,7 @@ __all__ = [
     "aggregate_mining_factors",
     "mining_optuna_distributions",
     "mining_parameter_specs",
+    "mining_parameter_limits",
     "parameter_catalog",
     "validate_mining_parameter_specs",
     "validate_search_space",
