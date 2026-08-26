@@ -1624,7 +1624,30 @@ def _resolve_alpha_configs(
     if factors == "all":
         return aggregate_mining_factors(**options)
     if isinstance(factors, list):
-        factors = {str(value["id"]): value for value in factors}
+        normalized: dict[str, Any] = {}
+        for value in factors:
+            # Compact form: ``factors: [ALPHA3, ALPHA7]``.  Alpha101 has a
+            # single mining adapter, so these entries can use the automatic
+            # parameter-space generator without repeating a full mapping.
+            if isinstance(value, str):
+                factor_id = value.strip().upper()
+                if not factor_id.startswith("ALPHA") or not factor_id[5:].isdigit():
+                    raise ValueError(
+                        "alpha101 factors 列表中的字符串必须是 ALPHA1..ALPHA101"
+                    )
+                normalized[factor_id] = {
+                    "module": "alpha101_mining",
+                    "execution_mode": "precomputed",
+                    "parameters": "auto",
+                }
+                continue
+            if not isinstance(value, Mapping) or not value.get("id"):
+                raise ValueError(
+                    "factors 列表项必须是 Alpha 名称字符串，或包含 id 的配置映射"
+                )
+            factor_id = str(value["id"]).strip().upper()
+            normalized[factor_id] = dict(value)
+        factors = normalized
     if not isinstance(factors, Mapping):
         return factors
     resolved = {}
@@ -2290,7 +2313,15 @@ def run_mining(parameter_config_path: str | Path, performance_config_path: str |
     if str(parameters_config.get("factor_class", "")).lower() == "alpha101":
         factors = _resolve_alpha_configs(parameters_config, factors)
     elif isinstance(factors, list):
-        factors = {str(value["id"]): value for value in factors}
+        normalized = {}
+        for value in factors:
+            if not isinstance(value, Mapping) or not value.get("id"):
+                raise ValueError(
+                    "非 alpha101 因子的 factors 列表项必须是包含 id 的配置映射；"
+                    "字符串列表无法推断 module"
+                )
+            normalized[str(value["id"])] = dict(value)
+        factors = normalized
     if not isinstance(factors, Mapping) or not factors:
         raise ValueError("factors must be a non-empty mapping or `all`")
     evaluation = dict(parameters_config.get("evaluation") or {})

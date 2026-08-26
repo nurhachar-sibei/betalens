@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import sqlite3
 import types
@@ -12,6 +13,7 @@ import pytest
 import yaml
 
 import betalens.factor.mining as mining
+import betalens.factor.mining_audit as mining_audit
 import betalens.factor.mining_optuna as mining_optuna
 from betalens.factor.mining_cache import CacheRequest, MiningCache
 from betalens.factor.mining_optuna import (
@@ -26,6 +28,87 @@ from betalens.factor.mining_optuna import (
     suggest_params,
     tell_trial,
 )
+
+
+def test_alpha101_compact_factor_list_expands_automatic_configs(monkeypatch):
+    alpha_directory = Path(__file__).parents[1] / "betalens-factor" / "alpha101"
+    monkeypatch.syspath_prepend(str(alpha_directory))
+
+    resolved = mining._resolve_alpha_configs(
+        {
+            "alpha101_parameter_generation": {
+                "range_multiplier": 10,
+                "max_dimensions": 5,
+            }
+        },
+        ["ALPHA7", "alpha8"],
+    )
+
+    assert set(resolved) == {"ALPHA7", "ALPHA8"}
+    assert resolved["ALPHA7"]["module"] == "alpha101_mining"
+    assert resolved["ALPHA7"]["execution_mode"] == "precomputed"
+    assert isinstance(resolved["ALPHA7"]["parameters"], dict)
+
+
+def test_heatmap_uses_all_parameter_pairs_and_mean_aggregation(tmp_path):
+    specs = {
+        "open_sum_window": {"type": "int", "low": 1, "high": 2},
+        "returns_sum_window": {"type": "int", "low": 1, "high": 2},
+        "base_delay_lag": {"type": "int", "low": 1, "high": 2},
+        "alpha_id": {"type": "int", "low": 8, "high": 8},
+    }
+    rows = []
+    for length, step in ((252, 21), (504, 63)):
+        for open_window in (1, 2):
+            for returns_window in (1, 2):
+                for delay_lag in (1, 2):
+                    rows.append({
+                        "factor_id": "ALPHA8",
+                        "candidate_id": f"{length}-{open_window}-{returns_window}-{delay_lag}",
+                        "stage": "fine",
+                        "window_id": f"{length}/{step}/0",
+                        "window_start": "2020-01-01",
+                        "window_end": "2020-12-31",
+                        "open_sum_window": open_window,
+                        "returns_sum_window": returns_window,
+                        "base_delay_lag": delay_lag,
+                        "alpha_id": 8,
+                        "sharpe": float(delay_lag),
+                        "ann_ret": float(delay_lag) / 10,
+                        "calmar": float(delay_lag) / 2,
+                        "mdd": float(delay_lag) / 20,
+                        "error": None,
+                    })
+    frame = pd.DataFrame(rows)
+    assert mining_audit._heatmap_parameter_pairs(frame, specs) == [
+        ("open_sum_window", "returns_sum_window"),
+        ("open_sum_window", "base_delay_lag"),
+        ("returns_sum_window", "base_delay_lag"),
+    ]
+    matrix = mining_audit._heatmap_matrix(
+        frame.loc[frame.window_id.eq("252/21/0")],
+        "open_sum_window",
+        "returns_sum_window",
+        "sharpe",
+    )
+    assert matrix.loc[1, 1] == pytest.approx(1.5)
+
+    metadata = {
+        "factor_id": "ALPHA8",
+        "configuration": {
+            "parameter_space": {"evaluation": {"span": ["2020-01-01", "2020-12-31"]}}
+        },
+        "resolved_parameter_specs": specs,
+    }
+    output = mining_audit._write_heatmap_report(tmp_path, metadata, frame)
+    png_paths = [Path(path) for path in output if str(path).endswith(".png")]
+    assert len(png_paths) == 6
+    assert all("_total_" in path.name for path in png_paths)
+    assert not any(name in path.name for path in png_paths for name in ("train", "test", "valid"))
+    report = json.loads((tmp_path / "热力图报告.json").read_text(encoding="utf-8"))
+    assert len(report) == 6
+    assert {row["aggregation"] for row in report} == {"mean"}
+    assert {(row["window_length"], row["window_step"]) for row in report} == {(252, 21), (504, 63)}
 
 
 def test_optuna_search_supports_log_and_composite_categories():

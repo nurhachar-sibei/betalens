@@ -35,6 +35,23 @@ Alpha101 可以在 ``parameter_space.yaml`` 中逐因子显式声明参数空间
 为 ALPHA1 至 ALPHA101 生成参数定义。显式参数映射不会调用自动生成逻辑；显式
 因子写成 ``parameters: auto`` 时会只为该因子调用自动生成逻辑。
 
+一次挖掘多个 Alpha 时，可以直接使用名称列表。每个名称会自动补齐
+``alpha101_mining``、``precomputed`` 和自动参数空间：
+
+.. code-block:: yaml
+
+   factors: [ALPHA3, ALPHA7, ALPHA8]
+
+需要逐因子覆盖配置时，也支持带 ``id`` 的映射列表：
+
+.. code-block:: yaml
+
+   factors:
+     - id: ALPHA3
+       module: alpha101_mining
+       execution_mode: precomputed
+       parameters: auto
+
 自动生成首先读取 ``alpha101_formulas.py`` 中各 ``alphaN`` 函数的关键字默认值，
 再根据参数名后缀分类。``*_window``、``*_lag``、``*_threshold``、
 ``*_exponent`` 和 ``*_weight`` 可搜索；其他参数固定为论文默认值。默认按照公式
@@ -152,3 +169,23 @@ NPY/memmap 保存行情、成交价、PIT、交易状态和行业面板；重叠
 ``挖掘审计.xlsx`` 包含运行概览、参数空间、搜索进度、全部窗口表现、候选汇总、
 赢家参数、赢家汇总和错误。旧版扁平 CSV/Parquet、``run_manifest.json``、
 ``selected_candidates.yaml`` 和 ``selected_nav`` 不再生成。
+
+热力图报告
+-----------
+
+任务结束时，审计目录会按“滑动窗口组合 × 参数对”生成 total 热力图，以及
+``热力图报告.json``。例如：
+
+::
+
+   热力图_total_252日窗口_21日步长_参数对01.png
+
+所有可变参数自动做两两组合；三个参数会产生三个参数对。每张图包含夏普比率、
+年化收益率、卡玛比率和最大回撤四个面板，单元格取相同参数坐标下全部窗口实例和
+搜索阶段记录的平均值。粗搜、自适应收敛、扩边、细搜及稳定性验证均纳入统计，
+但时间区间只展示完整 ``evaluation.span``（total），不再生成 train/test/valid 图。
+
+单参数因子降级为“参数 × 候选”热力图；完全没有参数变化时生成单值图。
+``热力图报告.json`` 记录窗口长度、滑动步长、参数轴、聚合方法和实际图像路径；
+图像路径同时记录在 ``metadata.yaml`` 的 ``heatmap_paths`` 和
+``FactorMiningResult.heatmap_paths``。

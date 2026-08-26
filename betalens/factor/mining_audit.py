@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import os
 import platform
@@ -242,6 +243,175 @@ def _style_workbook(path: Path) -> None:
     workbook.save(path)
 
 
+def _total_range(metadata: Mapping[str, Any]) -> tuple[pd.Timestamp, pd.Timestamp] | None:
+    """Resolve the complete evaluation range used by audit heatmaps."""
+    configuration = metadata.get("configuration", {})
+    parameter_space = configuration.get("parameter_space", {}) if isinstance(configuration, Mapping) else {}
+    evaluation = parameter_space.get("evaluation", {}) if isinstance(parameter_space, Mapping) else {}
+    span = evaluation.get("span") if isinstance(evaluation, Mapping) else None
+    if not span and isinstance(parameter_space, Mapping):
+        span = parameter_space.get("span")
+    if not isinstance(span, (list, tuple)) or len(span) != 2:
+        return None
+    start, end = pd.Timestamp(span[0]).normalize(), pd.Timestamp(span[1]).normalize()
+    if start > end:
+        return None
+    return start, end
+
+
+def _heatmap_parameter_pairs(frame: pd.DataFrame, parameter_specs: Mapping[str, Any]) -> list[tuple[str, str]]:
+    varying = []
+    for name in parameter_specs:
+        if name not in frame:
+            continue
+        values = frame[name].dropna()
+        if values.nunique(dropna=True) > 1:
+            varying.append(name)
+    if len(varying) >= 2:
+        return list(itertools.combinations(varying, 2))
+    if len(varying) == 1:
+        return [(varying[0], "候选")]
+    return [("候选", "候选")]
+
+
+def _heatmap_matrix(frame: pd.DataFrame, row_name: str, column_name: str, metric: str) -> pd.DataFrame:
+    work = frame.copy()
+    if row_name == "候选":
+        work[row_name] = work["candidate_id"].astype(str)
+    if column_name == "候选":
+        work[column_name] = work["candidate_id"].astype(str)
+    work[metric] = pd.to_numeric(work.get(metric), errors="coerce")
+    work = work.dropna(subset=[row_name, column_name, metric])
+    if work.empty:
+        return pd.DataFrame()
+    # Use the positional level here.  The fallback layout can intentionally
+    # use the same label ("候选") for both axes, and unstack("候选") is
+    # ambiguous when pandas sees two levels with that name.
+    grouped = work.groupby([row_name, column_name], dropna=False)[metric].mean()
+    matrix = grouped.unstack(level=1).sort_index()
+    matrix.columns.name = column_name
+    return matrix
+
+
+def _write_heatmap_report(
+    audit_dir: Path,
+    metadata: Mapping[str, Any],
+    window_results: pd.DataFrame,
+) -> list[str]:
+    """Write parameter heatmap PNGs and a machine-readable chart index."""
+    if window_results.empty:
+        return []
+    valid = window_results.loc[window_results.get("error", pd.Series(index=window_results.index)).isna()].copy()
+    valid["window_start"] = pd.to_datetime(valid.get("window_start"), errors="coerce").dt.normalize()
+    valid["window_end"] = pd.to_datetime(valid.get("window_end"), errors="coerce").dt.normalize()
+    valid = valid.dropna(subset=["window_start", "window_end"])
+    total_range = _total_range(metadata)
+    if total_range is None:
+        return []
+    period_start, period_end = total_range
+    total_mask = (valid["window_end"] >= period_start) & (valid["window_start"] <= period_end)
+    total_frame = valid.loc[total_mask].copy()
+    window_parts = total_frame.get("window_id", pd.Series(index=total_frame.index, dtype=object)).astype(str).str.extract(
+        r"^(?P<window_length>\d+)/(?P<window_step>\d+)(?:/|$)"
+    )
+    total_frame["_window_length"] = pd.to_numeric(window_parts["window_length"], errors="coerce")
+    total_frame["_window_step"] = pd.to_numeric(window_parts["window_step"], errors="coerce")
+    total_frame = total_frame.dropna(subset=["_window_length", "_window_step"])
+    total_frame["_window_length"] = total_frame["_window_length"].astype(int)
+    total_frame["_window_step"] = total_frame["_window_step"].astype(int)
+    parameter_specs = metadata.get("resolved_parameter_specs", {})
+    if not isinstance(parameter_specs, Mapping):
+        parameter_specs = {}
+    pairs = _heatmap_parameter_pairs(total_frame, parameter_specs)
+    metrics = [("sharpe", "夏普比率"), ("ann_ret", "年化收益率"), ("calmar", "卡玛比率"), ("mdd", "最大回撤")]
+    output_paths: list[str] = []
+    index_rows: list[dict[str, Any]] = []
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg", force=True)
+        import matplotlib.pyplot as plt
+        import numpy as np
+        from matplotlib import font_manager
+
+        # Prefer an installed CJK font so Chinese worksheet/report labels are
+        # rendered instead of producing glyph-missing warnings or tofu boxes.
+        preferred_fonts = ("Microsoft YaHei", "SimHei", "Noto Sans CJK SC", "Arial Unicode MS")
+        available_fonts = {font.name for font in font_manager.fontManager.ttflist}
+        for font_name in preferred_fonts:
+            if font_name in available_fonts:
+                plt.rcParams["font.sans-serif"] = [font_name]
+                break
+        plt.rcParams["axes.unicode_minus"] = False
+    except ImportError as exc:
+        index_path = audit_dir / "热力图报告.txt"
+        index_path.write_text(f"无法生成热力图：缺少 matplotlib（{exc}）\n", encoding="utf-8")
+        return [str(index_path)]
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    schemes = total_frame[["_window_length", "_window_step"]].drop_duplicates().sort_values(
+        ["_window_length", "_window_step"]
+    )
+    for window_length, window_step in schemes.itertuples(index=False, name=None):
+        scheme_frame = total_frame.loc[
+            total_frame["_window_length"].eq(window_length)
+            & total_frame["_window_step"].eq(window_step)
+        ]
+        for pair_index, (row_name, column_name) in enumerate(pairs, 1):
+            figure, axes = plt.subplots(2, 2, figsize=(16, 11), constrained_layout=True)
+            figure.suptitle(
+                f"{metadata.get('factor_id', '因子')} 参数表现热力图 · total\n"
+                f"{window_length}日窗口 / 每{window_step}日滑动 · "
+                f"参数轴：{row_name} × {column_name} · 聚合：平均值",
+                fontsize=14,
+            )
+            for axis, (metric, title) in zip(axes.ravel(), metrics):
+                matrix = _heatmap_matrix(scheme_frame, row_name, column_name, metric)
+                if matrix.empty:
+                    axis.text(0.5, 0.5, "暂无有效结果", ha="center", va="center", fontsize=13)
+                    axis.set_axis_off()
+                    continue
+                values = matrix.to_numpy(dtype=float)
+                image = axis.imshow(values, aspect="auto", cmap="RdYlGn", interpolation="nearest")
+                axis.set_title(title)
+                axis.set_xlabel(column_name)
+                axis.set_ylabel(row_name)
+                axis.set_xticks(range(len(matrix.columns)), [str(value) for value in matrix.columns], rotation=45, ha="right")
+                axis.set_yticks(range(len(matrix.index)), [str(value) for value in matrix.index])
+                if values.size <= 144:
+                    finite = values[np.isfinite(values)]
+                    threshold = (float(finite.min()) + float(finite.max())) / 2 if finite.size else 0.0
+                    for row_index in range(values.shape[0]):
+                        for column_index in range(values.shape[1]):
+                            value = values[row_index, column_index]
+                            if np.isfinite(value):
+                                axis.text(column_index, row_index, f"{value:.3g}", ha="center", va="center", fontsize=7, color="black" if value >= threshold else "white")
+                figure.colorbar(image, ax=axis, shrink=0.82)
+            path = audit_dir / (
+                f"热力图_total_{window_length}日窗口_{window_step}日步长_参数对{pair_index:02d}.png"
+            )
+            figure.savefig(path, dpi=150, bbox_inches="tight")
+            plt.close(figure)
+            output_paths.append(str(path))
+            index_rows.append({
+                "period": "total",
+                "start": period_start.date().isoformat(),
+                "end": period_end.date().isoformat(),
+                "window_length": int(window_length),
+                "window_step": int(window_step),
+                "window_count": int(scheme_frame["window_id"].nunique()),
+                "rows": int(len(scheme_frame)),
+                "aggregation": "mean",
+                "search_stages": sorted(scheme_frame.get("stage", pd.Series(dtype=str)).dropna().astype(str).unique()),
+                "row_parameter": row_name,
+                "column_parameter": column_name,
+                "path": str(path),
+            })
+    report_path = audit_dir / "热力图报告.json"
+    report_path.write_text(json.dumps(index_rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    output_paths.append(str(report_path))
+    return output_paths
+
+
 @dataclass
 class FactorMiningResult:
     factor_id: str
@@ -257,6 +427,7 @@ class FactorMiningResult:
     stage_window_results: dict[str, pd.DataFrame] = field(default_factory=dict)
     stage_summaries: dict[str, pd.DataFrame] = field(default_factory=dict)
     selected_candidates: pd.DataFrame = field(default_factory=pd.DataFrame)
+    heatmap_paths: tuple[str, ...] = ()
 
 
 @dataclass
@@ -463,6 +634,32 @@ class MiningTask:
             winners=winners.to_dict(orient="records"),
             **updates,
         )
+        # Heatmaps are an audit supplement.  A missing plotting dependency or
+        # malformed optional metric must not erase the primary mining result.
+        try:
+            heatmap_paths = tuple(_write_heatmap_report(self.audit_dir, self.metadata, windows))
+        except Exception as exc:
+            heatmap_paths = ()
+            result_counts = dict(self.metadata.get("result_counts") or {})
+            result_counts["errors"] = int(result_counts.get("errors", 0)) + 1
+            self.write_metadata(
+                heatmap_error=f"{type(exc).__name__}: {exc}",
+                result_counts=result_counts,
+            )
+            self.store.append(
+                "errors",
+                [{
+                    "factor_id": self.factor_id,
+                    "candidate_id": "",
+                    "window_id": "",
+                    "stage": "audit",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }],
+            )
+        if heatmap_paths:
+            self.write_metadata(heatmap_paths=list(heatmap_paths))
+            result.heatmap_paths = heatmap_paths
         self.export_workbook()
         self.store.close()
 

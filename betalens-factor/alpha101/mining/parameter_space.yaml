@@ -3,22 +3,44 @@ version: 1
 # 因子类别；用于任务元信息、输出归类，并启用 alpha101 的 `factors: all` 展开。
 factor_class: alpha101
 
-# factors 有两种写法：
-# 1. 像下面一样显式列出一个或多个 Alpha；
+# factors 有三种写法：
+# 1. 像下面一样显式配置一个或多个 Alpha；
 # 2. 将整个 factors 映射替换为 `factors: all`，自动生成 ALPHA1 至 ALPHA101。
+# 3. 使用紧凑列表，如 `factors: [ALPHA8, ALPHA9]`，自动生成这些 Alpha 的参数空间。
 # `all` 使用 alpha101_parameters.py 的启发式规则，默认最多放开每个公式前五个
 # 可搜索参数；显式配置不会调用自动空间生成逻辑。
 # 显式因子也可像 ALPHA3 一样写 `parameters: auto`，只自动生成该因子的参数空间。
-factors: all
-
-#  ALPHA3:
-#    # 可导入且提供 make_mining_spec(params) 的 Python 模块。
-#    module: alpha101_mining
-#    # 可选：precomputed | rolling_fit。Alpha101 使用 precomputed。
-#    execution_mode: precomputed
-#    # 可选：auto | 显式参数映射。auto 使用下方的 Alpha101 自动生成配置。
-#    # ALPHA3 默认窗口为 10，在当前十倍跨度下自动生成 1..100 的 log 空间。
-#    parameters: auto
+factors:
+  ALPHA8:
+    # 可导入且提供 make_mining_spec(params) 的 Python 模块。
+    module: alpha101_mining
+    # ALPHA8 参数在全区间固定，使用 precomputed：每组参数只计算一次完整净值。
+    execution_mode: precomputed
+    # ALPHA8 论文默认参数为 5、5、10；这里使用覆盖一个数量级的宽范围。
+    parameters:
+      open_sum_window:
+        type: int
+        low: 1
+        high: 50
+        step: 1
+        scale: log
+      returns_sum_window:
+        type: int
+        low: 1
+        high: 50
+        step: 1
+        scale: log
+      base_delay_lag:
+        type: int
+        low: 1
+        high: 100
+        step: 1
+        scale: log
+    # 自动扩边不能突破的硬边界；窗口类上限 1260，滞后类上限 504。
+    parameter_limits:
+      open_sum_window: {low: 1, high: 1260}
+      returns_sum_window: {low: 1, high: 1260}
+      base_delay_lag: {low: 1, high: 504}
 
 # 仅用于 `factors: all` 或 `parameters: auto`。
 alpha101_parameter_generation:
@@ -43,6 +65,7 @@ evaluation:
   engine: vector
   # 回测初始资金，必须为正数。
   initial_amount: 100000000
+  # 热力图只展示完整 span（total），并按每种滑动窗口组合分别输出。
   # 可选：行情查询容忍时间（小时），默认 24。
   # time_tolerance: 24
 
@@ -98,8 +121,8 @@ search:
     top_k: 8
     # 每个数值参数在局部边界内生成的网格点数，正整数。
     points_per_dimension: 7
-    # 细搜候选总上限，防止多参数笛卡尔积失控。
-    max_candidates: 256
+    # ALPHA8 有三个参数，每维 7 点，允许完整执行 7^3=343 个局部网格组合。
+    max_candidates: 343
   stability:
     # 可选：true | false。对最终赢家附近施加随机参数误差，验证局部稳定性。
     enabled: true
