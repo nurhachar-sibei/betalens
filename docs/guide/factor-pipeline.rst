@@ -70,6 +70,7 @@ YAML 结构
      start_date: '2024-01-01'
      end_date: '2024-12-31'
      rebal_freq: W
+     grouping_mode: equal_count
      n_quantiles: 20
      initial_amount: 100000000
      include_profiling: true
@@ -141,6 +142,17 @@ FactorSpec
 * ``use_industry`` / ``use_mktcap``：行业和市值中性化。
 * ``weight_mode``、``long_groups``、``short_groups``：权重生成口径。
 * ``backtest_metric``：回测成交价指标。
+
+``run.grouping_mode`` 支持两种截面分组口径：
+
+* ``equal_count``：优先保证每组股票数相当，严格生成 ``n_quantiles`` 组；相同特征值可能跨组。
+* ``value``：相同特征值绝不跨组，重复分位边界会合并，因此实际组数可能少于 ``n_quantiles``。
+
+``classic-long-short`` 始终逐期选择实际最大/最小标签。``freeplay`` 在
+``equal_count`` 下可使用数值标签；在 ``value`` 下必须使用 ``max`` / ``min``，
+以避免实际组数变化时数值标签含义漂移。Profiling Excel 会额外输出
+``group_balance_by_date`` 和 ``group_balance_summary``，展示组间数量差异、
+同值边界和相邻组特征值区分度。
 
 ``FactorPipeline.run(..., warmup_days=N)`` 可用日历日显式覆盖自动预热；省略或在 YAML 中设为 ``null`` 时，管线根据 ``required_history_bars`` 与算子参数推断。旧 YAML 无需增加上述可选字段。
 

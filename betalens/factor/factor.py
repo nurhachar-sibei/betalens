@@ -211,7 +211,7 @@ def pre_query_characteristic_data(date_list, metric, time_tolerance=24*2*365, ta
         data.close()
 
 
-def single_characteristic(pre_queried_data, metric, quantiles):
+def single_characteristic(pre_queried_data, metric, quantiles, grouping_mode='equal_count'):
     """
     单特征分组打标签
 
@@ -221,6 +221,11 @@ def single_characteristic(pre_queried_data, metric, quantiles):
             可选列：datetime, diff_hours, name
         metric: 公司特征指标名称
         quantiles: 分位数字典，如 {"股息率(报告期)": 10}
+        grouping_mode: ``equal_count`` 或 ``value``。
+            ``equal_count`` 优先保证各组股票数相当且严格生成目标组数，
+            相同特征值必要时可能分到不同组；有效股票数少于目标组数时报错。
+            ``value`` 严格保证相同特征值不跨组，重复分位点会合并，
+            因此实际组数可能少于目标组数。
 
     Returns:
         labeled_pool: 打标签后的DataFrame，包含特征分组标签
@@ -237,30 +242,90 @@ def single_characteristic(pre_queried_data, metric, quantiles):
     # 可选：过滤年报时间
     # labeled_pool = labeled_pool.drop(labeled_pool[labeled_pool['年报时间'] < labeled_pool['datetime']].index)
 
-    def single_sort(df, keys, quantile_dict):
-        """单特征分组排序"""
+    mode = str(grouping_mode).strip().lower().replace('-', '_')
+    mode_aliases = {
+        'equal': 'equal_count',
+        'equal_size': 'equal_count',
+        'quantile': 'equal_count',
+        'strict_value': 'value',
+        'unequal': 'value',
+    }
+    mode = mode_aliases.get(mode, mode)
+    if mode not in {'equal_count', 'value'}:
+        raise ValueError("grouping_mode 必须是 'equal_count' 或 'value'")
+
+    def single_sort(df, keys, quantile_dict, input_ts=None):
+        """对单个截面分组，标签始终按特征值从低到高连续编号。"""
         if len(keys) != len(quantile_dict):
             raise ValueError("keys 和 quantile_dict 的长度必须相等")
         for key in keys:
-            df[key + '_label'] = pd.qcut(
-                df[key].astype(float),
-                quantile_dict[key],
-                labels=False,
-                duplicates='drop'
-            )
+            target_groups = int(quantile_dict[key])
+            if target_groups < 1:
+                raise ValueError(f"目标分组数必须大于 0: {key}={target_groups}")
+            values = pd.to_numeric(df[key], errors='coerce')
+            valid = values.notna()
+            n_valid = int(valid.sum())
+            labels = pd.Series(pd.NA, index=df.index, dtype='Int64')
+
+            if not n_valid:
+                df[key + '_label'] = labels
+                continue
+
+            if mode == 'equal_count':
+                if n_valid < target_groups:
+                    raise ValueError(
+                        f"{key} 在 {input_ts} 仅有 {n_valid} 个有效股票，"
+                        f"无法严格生成 {target_groups} 个等额分组"
+                    )
+                # 相同值时以代码稳定打破排序，保证重复运行结果一致。
+                ordered = df.loc[valid, [key, 'code']].copy()
+                ordered[key] = values.loc[valid]
+                ordered['_code_order'] = ordered['code'].astype(str)
+                ordered = ordered.sort_values([key, '_code_order'], kind='mergesort')
+                positions = pd.Series(range(n_valid), index=ordered.index)
+                labels.loc[ordered.index] = (positions * target_groups // n_valid).astype('Int64')
+            else:
+                unique_count = int(values.loc[valid].nunique())
+                if unique_count == 1:
+                    labels.loc[valid] = 0
+                else:
+                    raw_labels = pd.qcut(
+                        values.loc[valid],
+                        target_groups,
+                        labels=False,
+                        duplicates='drop',
+                    )
+                    # qcut 在删除重复边界后可能留下非连续标签，统一重编码。
+                    present = sorted(pd.Series(raw_labels).dropna().unique())
+                    remap = {old: new for new, old in enumerate(present)}
+                    labels.loc[valid] = pd.Series(raw_labels, index=values.loc[valid].index).map(remap).astype('Int64')
+
+                split_ties = (
+                    pd.DataFrame({'value': values.loc[valid], 'label': labels.loc[valid]})
+                    .groupby('value', dropna=False)['label']
+                    .nunique()
+                    .gt(1)
+                    .any()
+                )
+                if split_ties:
+                    raise RuntimeError(f"value 分组违反相同值不可跨组约束: {key} {input_ts}")
+
+            df[key + '_label'] = labels
         return df
 
     # 按时间分组，对每组进行分位数分组
     # include_groups=False 避免 pandas FutureWarning；分组键 input_ts 会落在
     # 结果 MultiIndex 的 level 0，用 reset_index(level=0) 恢复为列
     labeled_pool = labeled_pool.groupby('input_ts').apply(
-        lambda group: single_sort(group, [metric], quantiles),
+        lambda group: single_sort(group, [metric], quantiles, input_ts=group.name),
         include_groups=False,
     ).reset_index(level=0)
     labeled_pool.set_index(['input_ts', 'code'], inplace=True)
 
     # 将metric信息存储为列名后缀，而非DataFrame属性（更规范）
     labeled_pool.attrs['metric'] = metric
+    labeled_pool.attrs['grouping_mode'] = mode
+    labeled_pool.attrs['target_groups'] = int(quantiles[metric])
 
     return labeled_pool
 
@@ -563,6 +628,8 @@ def get_single_factor_weight(labeled_pool, params):
             - 'mode': 'classic-long-short' 或 'freeplay'
             - 'long': 做多标签列表（freeplay模式）
             - 'short': 做空标签列表（freeplay模式）
+            - 'grouping_mode': ``equal_count`` 或 ``value``。value 模式下
+              freeplay 只能使用 ``max`` / ``min`` 动态选择器。
 
     Returns:
         weights: 权重DataFrame，索引为input_ts，列为code
@@ -570,15 +637,83 @@ def get_single_factor_weight(labeled_pool, params):
     factor_key = params['factor_key']
     import numpy as np
 
+    grouping_mode = str(
+        params.get('grouping_mode') or labeled_pool.attrs.get('grouping_mode') or 'equal_count'
+    ).strip().lower().replace('-', '_')
+    grouping_mode = {
+        'equal': 'equal_count', 'equal_size': 'equal_count', 'quantile': 'equal_count',
+        'strict_value': 'value', 'unequal': 'value',
+    }.get(grouping_mode, grouping_mode)
+    if grouping_mode not in {'equal_count', 'value'}:
+        raise ValueError("grouping_mode 必须是 'equal_count' 或 'value'")
+
+    def _selector_list(value):
+        if value is None:
+            return []
+        if isinstance(value, (str, int, np.integer)):
+            return [value]
+        return list(value)
+
+    def _normalize_selector(value):
+        if isinstance(value, str):
+            selector = value.strip().lower()
+            if selector not in {'max', 'min'}:
+                if selector.lstrip('-').isdigit():
+                    return int(selector)
+                raise ValueError(f"不支持的分组选择器: {value!r}，仅支持整数、'max'、'min'")
+            return selector
+        if isinstance(value, (int, np.integer)):
+            return int(value)
+        raise TypeError(f"分组选择器必须是整数或 'max'/'min': {value!r}")
+
+    long_selectors = [_normalize_selector(value) for value in _selector_list(params.get('long'))]
+    short_selectors = [_normalize_selector(value) for value in _selector_list(params.get('short'))]
+    all_selectors = long_selectors + short_selectors
+    if params.get('mode') == 'freeplay' and not all_selectors:
+        raise ValueError("freeplay 模式必须至少设置 long 或 short 分组")
+    if (
+        params.get('mode') == 'freeplay'
+        and grouping_mode == 'value'
+        and any(isinstance(value, int) for value in all_selectors)
+    ):
+        raise ValueError(
+            "value 分组的实际组数会随截面变化，freeplay 模式必须使用 'max'/'min'，不能使用数值标签"
+        )
+    target_groups = labeled_pool.attrs.get('target_groups')
+    if grouping_mode == 'equal_count' and target_groups is not None:
+        invalid = [value for value in all_selectors if isinstance(value, int) and not 0 <= value < int(target_groups)]
+        if invalid:
+            raise ValueError(f"分组标签超出 0~{int(target_groups) - 1}: {invalid}")
+
+    def _resolved_selectors(selectors, group):
+        label_col = factor_key + '_label'
+        available = pd.to_numeric(group[label_col], errors='coerce').dropna()
+        if available.empty:
+            return []
+        min_label = int(available.min())
+        max_label = int(available.max())
+        return [
+            (selector, max_label if selector == 'max' else min_label if selector == 'min' else selector)
+            for selector in selectors
+        ]
+
+    def _mapping_value(mapping, selector, label, default):
+        for key in (selector, str(selector), label, str(label)):
+            if key in mapping:
+                return mapping[key]
+        return default
+
     def f1(group):
+        """经典多空始终按当期实际标签极值选组，兼容动态组数。"""
         group = group.copy()
         weight_col = factor_key + '_weight'
         label_col = factor_key + '_label'
         group[weight_col] = 0.0
         max_label = group[label_col].max()
         min_label = group[label_col].min()
-        group[weight_col] = np.where(group[label_col] == max_label, 1.0,
-                                     np.where(group[label_col] == min_label, -1.0, 0.0))
+        is_max = (group[label_col] == max_label).fillna(False)
+        is_min = (group[label_col] == min_label).fillna(False)
+        group[weight_col] = np.where(is_max, 1.0, np.where(is_min, -1.0, 0.0))
         group = group[group[weight_col] != 0]
         return group
     
@@ -594,8 +729,8 @@ def get_single_factor_weight(labeled_pool, params):
         intra_group_allocation = params.get('intra_group_allocation', {})  # 组内分配方式配置
         
         # 步骤3: 获取做多做空标签列表
-        long_labels = params['long']
-        short_labels = params['short']
+        resolved_long = _resolved_selectors(long_selectors, group)
+        resolved_short = _resolved_selectors(short_selectors, group)
         
         # 步骤4: 提取多空两侧的权重配置
         long_group_weights = group_weights.get('long', {})
@@ -605,20 +740,26 @@ def get_single_factor_weight(labeled_pool, params):
         
         # 步骤5: 计算做多组的权重总和（用于归一化）
         if long_group_weights:
-            total_long_weight = sum(long_group_weights.get(label, 1) for label in long_labels)
+            total_long_weight = sum(
+                _mapping_value(long_group_weights, selector, label, 1)
+                for selector, label in resolved_long
+            )
         else:
-            total_long_weight = len(long_labels)
+            total_long_weight = len(resolved_long)
         
         # 步骤6: 计算做空组的权重总和（用于归一化）
         if short_group_weights:
-            total_short_weight = sum(short_group_weights.get(label, 1) for label in short_labels)
+            total_short_weight = sum(
+                _mapping_value(short_group_weights, selector, label, 1)
+                for selector, label in resolved_short
+            )
         else:
-            total_short_weight = len(short_labels)
+            total_short_weight = len(resolved_short)
         
         # 步骤7: 遍历做多标签，分配权重
-        for label in long_labels:
+        for selector, label in resolved_long:
             # 步骤7.1: 筛选当前标签组的股票
-            mask = group[label_col] == label
+            mask = (group[label_col] == label).fillna(False)
             group_stocks = group[mask]
             
             if len(group_stocks) == 0:
@@ -626,12 +767,14 @@ def get_single_factor_weight(labeled_pool, params):
             
             # 步骤7.2: 计算当前组的组间权重
             if long_group_weights:
-                group_weight = long_group_weights.get(label, 1) / total_long_weight
+                group_weight = _mapping_value(long_group_weights, selector, label, 1) / total_long_weight
             else:
                 group_weight = 1 / total_long_weight
             
             # 步骤7.3: 获取当前组的组内分配配置
-            allocation_cfg = long_intra_allocation.get(label, {'method': 'equal'})
+            allocation_cfg = _mapping_value(
+                long_intra_allocation, selector, label, {'method': 'equal'}
+            )
             
             # 步骤7.4: 按因子值分配组内权重
             if allocation_cfg.get('method') == 'factor_value' and len(group_stocks) > 1:
@@ -667,9 +810,9 @@ def get_single_factor_weight(labeled_pool, params):
                 group.loc[mask, weight_col] = group_weight / len(group_stocks)
         
         # 步骤8: 遍历做空标签，分配权重（逻辑同做多，权重取负）
-        for label in short_labels:
+        for selector, label in resolved_short:
             # 步骤8.1: 筛选当前标签组的股票
-            mask = group[label_col] == label
+            mask = (group[label_col] == label).fillna(False)
             group_stocks = group[mask]
             
             if len(group_stocks) == 0:
@@ -677,12 +820,14 @@ def get_single_factor_weight(labeled_pool, params):
             
             # 步骤8.2: 计算当前组的组间权重
             if short_group_weights:
-                group_weight = short_group_weights.get(label, 1) / total_short_weight
+                group_weight = _mapping_value(short_group_weights, selector, label, 1) / total_short_weight
             else:
                 group_weight = 1 / total_short_weight
             
             # 步骤8.3: 获取当前组的组内分配配置
-            allocation_cfg = short_intra_allocation.get(label, {'method': 'equal'})
+            allocation_cfg = _mapping_value(
+                short_intra_allocation, selector, label, {'method': 'equal'}
+            )
             
             # 步骤8.4: 按因子值分配组内权重
             if allocation_cfg.get('method') == 'factor_value' and len(group_stocks) > 1:

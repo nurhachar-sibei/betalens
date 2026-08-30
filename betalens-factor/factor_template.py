@@ -381,6 +381,8 @@ def _factor_values_for_group_nav(factor_values, n_quantiles):
 
 def grouped_factor_statistics(labeled, name):
     """基于 single_characteristic 的全量分组矩阵生成统计表。"""
+    import pandas as pd
+
     label_col = f"{name}_label"
     df = labeled.reset_index()[["input_ts", "code", name, label_col]].copy()
     df = df.rename(columns={"input_ts": "信号日", "code": "股票代码", name: "因子值", label_col: "分组"})
@@ -398,6 +400,10 @@ def grouped_factor_statistics(labeled, name):
         )
         .reset_index()
     )
+    by_date_group = by_date_group.sort_values(["信号日", "分组"]).reset_index(drop=True)
+    by_date_group["prev_group_max"] = by_date_group.groupby("信号日")["max"].shift(1)
+    by_date_group["boundary_gap"] = by_date_group["min"] - by_date_group["prev_group_max"]
+    by_date_group["mean_gap"] = by_date_group.groupby("信号日")["mean"].diff()
     summary = (
         df.groupby("分组")["因子值"]
         .agg(
@@ -415,18 +421,94 @@ def grouped_factor_statistics(labeled, name):
     return df, by_date_group, summary
 
 
+def group_balance_statistics(labeled, name):
+    """评估逐期组间数量平衡和 firm characteristic 区分度。"""
+    import pandas as pd
+
+    values, by_date_group, _ = grouped_factor_statistics(labeled, name)
+    grouping_mode = str(labeled.attrs.get("grouping_mode", "unknown"))
+    target_groups = labeled.attrs.get("target_groups")
+    rows = []
+    for signal_date, group_stats in by_date_group.groupby("信号日", sort=True):
+        group_stats = group_stats.sort_values("分组")
+        counts = group_stats["count"].astype(float)
+        mean_gaps = group_stats["mean_gap"].dropna().abs()
+        boundary_gaps = group_stats["boundary_gap"].dropna()
+        section = values.loc[values["信号日"] == signal_date, "因子值"].dropna()
+        overall_std = float(section.std(ddof=0)) if len(section) > 1 else 0.0
+        min_mean_gap = float(mean_gaps.min()) if not mean_gaps.empty else np.nan
+        separation_ratio = min_mean_gap / overall_std if overall_std > 0 and np.isfinite(min_mean_gap) else 0.0
+        actual_groups = int(len(group_stats))
+        min_count = int(counts.min()) if not counts.empty else 0
+        max_count = int(counts.max()) if not counts.empty else 0
+        count_mean = float(counts.mean()) if not counts.empty else 0.0
+        count_std = float(counts.std(ddof=0)) if len(counts) > 1 else 0.0
+        same_value_boundaries = int(boundary_gaps.eq(0).sum())
+        overlap_boundaries = int(boundary_gaps.lt(0).sum())
+        rows.append({
+            "信号日": signal_date,
+            "grouping_mode": grouping_mode,
+            "target_groups": int(target_groups) if target_groups is not None else np.nan,
+            "actual_groups": actual_groups,
+            "target_met": bool(target_groups is None or actual_groups == int(target_groups)),
+            "total_stocks": int(counts.sum()),
+            "min_group_count": min_count,
+            "max_group_count": max_count,
+            "group_count_range": max_count - min_count,
+            "group_count_ratio": max_count / min_count if min_count else np.nan,
+            "group_count_cv": count_std / count_mean if count_mean else np.nan,
+            "count_balanced": bool(max_count - min_count <= 1),
+            "overall_factor_std": overall_std,
+            "min_adjacent_mean_gap": min_mean_gap,
+            "min_mean_gap_to_std": separation_ratio,
+            "min_value_boundary_gap": float(boundary_gaps.min()) if not boundary_gaps.empty else np.nan,
+            "same_value_boundary_count": same_value_boundaries,
+            "overlap_boundary_count": overlap_boundaries,
+            # 5% 总体标准差是诊断阈值；同时要求边界没有同值或交叠。
+            "value_separation_sufficient": bool(
+                actual_groups > 1
+                and separation_ratio >= 0.05
+                and same_value_boundaries == 0
+                and overlap_boundaries == 0
+            ),
+        })
+    by_date = pd.DataFrame(rows)
+    if by_date.empty:
+        return by_date, pd.DataFrame()
+    summary = pd.DataFrame([{
+        "grouping_mode": grouping_mode,
+        "target_groups": int(target_groups) if target_groups is not None else np.nan,
+        "periods": int(len(by_date)),
+        "target_met_ratio": float(by_date["target_met"].mean()),
+        "count_balanced_ratio": float(by_date["count_balanced"].mean()),
+        "value_separation_sufficient_ratio": float(by_date["value_separation_sufficient"].mean()),
+        "max_group_count_range": int(by_date["group_count_range"].max()),
+        "median_group_count_cv": float(by_date["group_count_cv"].median()),
+        "median_min_mean_gap_to_std": float(by_date["min_mean_gap_to_std"].median()),
+        "periods_with_same_value_boundaries": int((by_date["same_value_boundary_count"] > 0).sum()),
+    }])
+    return by_date, summary
+
+
 def append_grouped_profiling_excel(output_dir, name, labeled):
     """把全量分组矩阵与分组统计写入 profiling Excel。"""
+    import pandas as pd
+
     excel_path = f"{output_dir}/{name}_profiling.xlsx"
     values, by_date_group, summary = grouped_factor_statistics(labeled, name)
+    balance_by_date, balance_summary = group_balance_statistics(labeled, name)
     with pd.ExcelWriter(excel_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
         by_date_group.to_excel(writer, sheet_name="group_stats_by_date", index=False)
         summary.to_excel(writer, sheet_name="group_stats_summary", index=False)
         values.to_excel(writer, sheet_name="group_factor_values", index=False)
+        balance_by_date.to_excel(writer, sheet_name="group_balance_by_date", index=False)
+        balance_summary.to_excel(writer, sheet_name="group_balance_summary", index=False)
     return {
         "group_stats_by_date": by_date_group,
         "group_stats_summary": summary,
         "group_factor_values": values,
+        "group_balance_by_date": balance_by_date,
+        "group_balance_summary": balance_summary,
     }
 
 
@@ -541,9 +623,17 @@ class FactorPipeline:
     def _resolve_groups(self, n_q: int) -> tuple[list, list]:
         sp = self.spec
         if sp.weight_mode == "classic-long-short":
-            return [n_q - 1], [0]
-        long_groups = sp.long_groups or []
-        short_groups = sp.short_groups or []
+            return ["max"], ["min"]
+
+        def _as_list(value):
+            if value is None:
+                return []
+            if isinstance(value, (str, int)):
+                return [value]
+            return list(value)
+
+        long_groups = _as_list(sp.long_groups)
+        short_groups = _as_list(sp.short_groups)
         if not long_groups and not short_groups:
             raise ValueError("freeplay 模式必须至少设置 long_groups 或 short_groups")
         return long_groups or [], short_groups or []
@@ -718,6 +808,7 @@ class FactorPipeline:
 
     def run(self, start_date: str, end_date: str, *,
             rebal_freq: str = "D",
+            grouping_mode: str = "equal_count",
             universe: list | None = None,
             n_quantiles: int = 20,
             initial_amount: float = 1e8,
@@ -853,8 +944,16 @@ class FactorPipeline:
 
         # 5. 分组
         if verbose:
-            print(f"  开始分组: n_quantiles={n_quantiles}", flush=True)
-        labeled = single_characteristic(prequery, sp.name, {sp.name: n_quantiles})
+            print(
+                f"  开始分组: n_quantiles={n_quantiles}, grouping_mode={grouping_mode}",
+                flush=True,
+            )
+        labeled = single_characteristic(
+            prequery,
+            sp.name,
+            {sp.name: n_quantiles},
+            grouping_mode=grouping_mode,
+        )
         if verbose:
             print(f"  完成分组: {len(labeled)} 行", flush=True)
         factor_values = _labeled_to_factor_values(labeled, sp.name)
@@ -878,6 +977,7 @@ class FactorPipeline:
         weights = get_single_factor_weight(labeled, {
             'factor_key': sp.name, 'mode': sp.weight_mode,
             'long': long_groups, 'short': short_groups,
+            'grouping_mode': grouping_mode,
             'group_weights': sp.group_weights,
             'intra_group_allocation': sp.intra_group_allocation,
         })

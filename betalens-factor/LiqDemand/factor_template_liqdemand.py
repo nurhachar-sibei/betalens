@@ -117,6 +117,7 @@ class LiqDemandPipeline(FactorPipeline):
 
     def run(self, start_date: str, end_date: str, *,
             rebal_freq: str = "D",
+            grouping_mode: str = "equal_count",
             warmup_days: int = 400,
             pretom_only: bool = True,
             pretom_lo: int = 9,
@@ -209,7 +210,12 @@ class LiqDemandPipeline(FactorPipeline):
                 mktcap_col=mktcap_col, verbose=verbose)
 
         # 5. 分组
-        labeled = single_characteristic(prequery, sp.name, {sp.name: n_quantiles})
+        labeled = single_characteristic(
+            prequery,
+            sp.name,
+            {sp.name: n_quantiles},
+            grouping_mode=grouping_mode,
+        )
         factor_values = _labeled_to_factor_values(labeled, sp.name)
 
         # 5a. Profiling：基于 single_characteristic 的全量 n 分组矩阵。
@@ -224,6 +230,7 @@ class LiqDemandPipeline(FactorPipeline):
         weights = get_single_factor_weight(labeled, {
             'factor_key': sp.name, 'mode': sp.weight_mode,
             'long': long_groups, 'short': short_groups,
+            'grouping_mode': grouping_mode,
             'group_weights': sp.group_weights,
             'intra_group_allocation': sp.intra_group_allocation,
         })

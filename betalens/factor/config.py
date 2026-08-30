@@ -113,6 +113,8 @@ def run_parameters(config: Mapping[str, Any], config_path: str | Path) -> dict[s
         "dump_excel": bool(run["dump_excel"]),
         "output_dir": str(resolve_run_output_dir(config, config_path)),
     }
+    if "grouping_mode" in run:
+        params["grouping_mode"] = str(run["grouping_mode"])
     optional_bool = ("pretom_only", "verbose")
     optional_int = ("warmup_days", "pretom_lo", "pretom_hi")
     for key in optional_bool:

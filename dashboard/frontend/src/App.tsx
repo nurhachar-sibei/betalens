@@ -219,6 +219,14 @@ const groupComparisonSeries = (
     }));
 };
 
+const hasOnlyExtremeGroupSelectors = (value: unknown) => {
+  if (!hasGroupList(value)) return true;
+  const items = Array.isArray(value)
+    ? value
+    : String(value).replace(/[，；;]/g, ',').split(',');
+  return items.every((item) => ['max', 'min'].includes(String(item).trim().toLowerCase()));
+};
+
 const formatEventAssetLabel = (code: string, assets: EventStudyAsset[] | undefined) => {
   const asset = assets?.find((item) => item.code === code);
   const label = asString(asset?.label).trim();
@@ -298,6 +306,7 @@ const buildRunParams = (defaults: Record<string, unknown>) => ({
   initial_amount: asNumber(defaults.initial_amount, 100000000),
   rebal_freq: asString(defaults.rebal_freq, 'W'),
   n_quantiles: asNumber(defaults.n_quantiles, 80),
+  grouping_mode: asString(defaults.grouping_mode, 'equal_count'),
   index_code: asString(defaults.index_code),
   benchmark_code: asString(defaults.benchmark_code, asString(defaults.index_code)),
   direction: asString(defaults.direction, 'positive'),
@@ -635,6 +644,18 @@ function FactorPage({
       setError('自由分组模式必须至少填写做多分组或做空分组。');
       return;
     }
+    if (
+      !isTiming
+      && asString(params.weight_mode, 'freeplay') === 'freeplay'
+      && asString(params.grouping_mode, 'equal_count') === 'value'
+      && (
+        !hasOnlyExtremeGroupSelectors(params.long_groups)
+        || !hasOnlyExtremeGroupSelectors(params.short_groups)
+      )
+    ) {
+      setError('按值边界分组的自由分组模式只能填写 max 或 min。');
+      return;
+    }
     setResult(null);
     setLogs('[dashboard] 正在提交回测任务...\n');
     setState(null);
@@ -784,6 +805,13 @@ function ParameterPanel({
           <LabeledInput label="分组数" type="number" value={asString(params.n_quantiles)} onChange={(v) => onParam('n_quantiles', Number(v))} />
           <h3><ListFilter size={16} />分组模式</h3>
           <label className="field">
+            分组方法
+            <select value={asString(params.grouping_mode, 'equal_count')} onChange={(event) => onParam('grouping_mode', event.target.value)}>
+              <option value="equal_count">等额分组</option>
+              <option value="value">按值边界分组</option>
+            </select>
+          </label>
+          <label className="field">
             模式
             <select value={asString(params.weight_mode, 'freeplay')} onChange={(event) => onParam('weight_mode', event.target.value)}>
               <option value="freeplay">自由分组</option>
@@ -795,13 +823,13 @@ function ParameterPanel({
               <LabeledInput
                 label="做多分组"
                 value={formatGroupList(params.long_groups)}
-                placeholder="留空=无做多，如 19"
+                placeholder={asString(params.grouping_mode) === 'value' ? '按值分组请填 max/min' : '留空=无做多，如 19'}
                 onChange={(v) => onParam('long_groups', v)}
               />
               <LabeledInput
                 label="做空分组"
                 value={formatGroupList(params.short_groups)}
-                placeholder="留空=无做空，如 0,1"
+                placeholder={asString(params.grouping_mode) === 'value' ? '按值分组请填 max/min' : '留空=无做空，如 0,1'}
                 onChange={(v) => onParam('short_groups', v)}
               />
             </>

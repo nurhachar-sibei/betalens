@@ -349,11 +349,20 @@ class RunManager:
             if strategy_type != "timing" and not long_groups and not short_groups:
                 raise ValueError("freeplay 模式必须至少设置 long_groups 或 short_groups")
 
+            grouping_mode = str(run.parameters.get(
+                "grouping_mode", run_section.get("grouping_mode", "equal_count")
+            )).strip().lower().replace("-", "_")
+            if strategy_type != "timing" and grouping_mode in {"value", "strict_value", "unequal"}:
+                selectors = (long_groups or []) + (short_groups or [])
+                if any(not isinstance(value, str) or value.lower() not in {"max", "min"} for value in selectors):
+                    raise ValueError("value 分组的 freeplay 模式只能使用 max/min 分组选择器")
+
         for key in (
             "start_date",
             "end_date",
             "rebal_freq",
             "n_quantiles",
+            "grouping_mode",
             "initial_amount",
             "benchmark_code",
             "include_profiling",

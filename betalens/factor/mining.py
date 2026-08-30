@@ -955,7 +955,7 @@ def _preprocess(value: pd.DataFrame, factor: Any, signal_dates: Sequence[Any], d
 
 def _groups(factor: Any, quantiles: int) -> tuple[list[Any], list[Any]]:
     if getattr(factor, "weight_mode", "freeplay") == "classic-long-short":
-        return [quantiles - 1], [0]
+        return ["max"], ["min"]
     long_groups = list(getattr(factor, "long_groups", None) or [])
     short_groups = list(getattr(factor, "short_groups", None) or [])
     if not long_groups and not short_groups:
@@ -977,9 +977,21 @@ def _build_weights(factor_wide: pd.DataFrame, spec: MiningSpec, params: Mapping[
         if value.empty:
             return pd.DataFrame()
         quantiles = int(params.get("n_quantiles", 10))
-        labeled = single_characteristic(value, factor.name, {factor.name: quantiles})
+        grouping_mode = str(params.get("grouping_mode", "equal_count"))
+        labeled = single_characteristic(
+            value,
+            factor.name,
+            {factor.name: quantiles},
+            grouping_mode=grouping_mode,
+        )
         long_groups, short_groups = _groups(factor, quantiles)
-        weights = get_single_factor_weight(labeled, {"factor_key": factor.name, "mode": getattr(factor, "weight_mode", "freeplay"), "long": long_groups, "short": short_groups})
+        weights = get_single_factor_weight(labeled, {
+            "factor_key": factor.name,
+            "mode": getattr(factor, "weight_mode", "freeplay"),
+            "long": long_groups,
+            "short": short_groups,
+            "grouping_mode": grouping_mode,
+        })
     return _weights_on_rebalance(weights, pairs)
 
 
